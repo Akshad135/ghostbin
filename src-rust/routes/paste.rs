@@ -276,7 +276,7 @@ pub async fn handle_list(
     headers: HeaderMap,
     Query(params): Query<ListQuery>,
 ) -> impl IntoResponse {
-    if !auth::is_authenticated(&headers, &state.auth_key) {
+    if !auth::is_authenticated(&state.db, &headers).await {
         return json_error(StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
 
@@ -340,7 +340,7 @@ pub async fn handle_create(
     headers: HeaderMap,
     Json(body): Json<CreatePasteBody>,
 ) -> impl IntoResponse {
-    if !auth::is_authenticated(&headers, &state.auth_key) {
+    if !auth::is_authenticated(&state.db, &headers).await {
         return json_error(StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
 
@@ -454,7 +454,7 @@ pub async fn handle_get(
         return json_error(StatusCode::NOT_FOUND, "Paste not found").into_response();
     };
 
-    let authenticated = auth::is_authenticated(&headers, &state.auth_key);
+    let authenticated = auth::is_authenticated(&state.db, &headers).await;
 
     if !authenticated {
         if paste.share_wrapped_paste_key.is_none() {
@@ -703,7 +703,7 @@ pub async fn handle_update(
     Path(slug): Path<String>,
     Json(body): Json<UpdatePasteBody>,
 ) -> impl IntoResponse {
-    if !auth::is_authenticated(&headers, &state.auth_key) {
+    if !auth::is_authenticated(&state.db, &headers).await {
         return json_error(StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
 
@@ -801,7 +801,7 @@ pub async fn handle_update(
                 }
                 None => updates.push("burn_after_unlocks = NULL".to_string()),
             }
-            
+
             let burn_changed = match exists {
                 Some((_, ref old_trigger, old_unlocks)) => {
                     old_trigger.as_deref() != Some(trigger) || old_unlocks != burn.after_unlocks
@@ -890,7 +890,7 @@ pub async fn handle_delete(
     headers: HeaderMap,
     Path(slug): Path<String>,
 ) -> impl IntoResponse {
-    if !auth::is_authenticated(&headers, &state.auth_key) {
+    if !auth::is_authenticated(&state.db, &headers).await {
         return json_error(StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
 

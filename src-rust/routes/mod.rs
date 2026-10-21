@@ -16,14 +16,21 @@ pub fn api_router() -> Router<SharedState> {
     Router::new()
         .route("/ping", get(ping::handle_ping))
         .route("/stream", get(stream::handle_stream))
-        .route(
-            "/auth/login",
-            get(auth::handle_auth_check).post(auth::handle_login),
-        )
+        .route("/auth/params", get(auth::handle_params))
+        .route("/auth/setup", post(auth::handle_setup))
+        .route("/auth/login", post(auth::handle_login))
         .route("/auth/logout", post(auth::handle_logout))
-        .route("/auth/salt", get(auth::handle_salt))
+        .route(
+            "/auth/change-passphrase",
+            post(auth::handle_change_passphrase),
+        )
+        .route("/vault", get(auth::handle_vault))
+        // Legacy paste/file routes are replaced in the next build phase.
         .route("/paste", get(paste::handle_list).post(paste::handle_create))
-        .route("/paste/", get(paste::handle_list).post(paste::handle_create))
+        .route(
+            "/paste/",
+            get(paste::handle_list).post(paste::handle_create),
+        )
         .route(
             "/paste/{slug}",
             get(paste::handle_get)
@@ -31,7 +38,6 @@ pub fn api_router() -> Router<SharedState> {
                 .delete(paste::handle_delete),
         )
         .route("/paste/{slug}/unlock", post(paste::handle_unlock))
-        // File endpoints
         .route("/file/upload", post(file::handle_upload))
         .route(
             "/file/{slug}",

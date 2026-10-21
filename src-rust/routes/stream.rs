@@ -15,7 +15,7 @@ pub async fn handle_stream(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> axum::response::Response {
-    if !auth::is_authenticated(&headers, &state.auth_key) {
+    if !auth::is_authenticated(&state.db, &headers).await {
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
 

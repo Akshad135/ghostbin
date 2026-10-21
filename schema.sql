@@ -1,35 +1,70 @@
-CREATE TABLE IF NOT EXISTS pastes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    slug TEXT NOT NULL UNIQUE,
-    title TEXT NOT NULL,
-    content TEXT NOT NULL,
-    language TEXT NOT NULL,
-    pinned INTEGER NOT NULL DEFAULT 0,
-    burn_trigger TEXT CHECK (burn_trigger IN ('time', 'unlock_count') OR burn_trigger IS NULL),
-    burn_action TEXT NOT NULL DEFAULT 'delete' CHECK (burn_action IN ('revoke_share', 'delete')),
-    burn_at TEXT,
-    burn_after_unlocks INTEGER CHECK (burn_after_unlocks IS NULL OR (burn_after_unlocks > 0 AND burn_after_unlocks <= 100000)),
-    burn_unlocks_used INTEGER NOT NULL DEFAULT 0 CHECK (burn_unlocks_used >= 0),
-    burn_pending_delete_at TEXT,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    encrypted_paste_key TEXT NOT NULL,
-    share_wrapped_paste_key TEXT,
-    share_auth_salt TEXT,
-    share_auth_verifier TEXT
+-- GhostBin E2EE schema, version 1.
+-- The server never stores plaintext paste content, passphrases, or raw auth keys.
+
+CREATE TABLE settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    kdf_salt BLOB NOT NULL,
+    kdf_params TEXT NOT NULL,
+    auth_hash BLOB NOT NULL,
+    wrapped_vault_key BLOB NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS files (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    slug TEXT NOT NULL UNIQUE,
-    paste_slug TEXT,
-    file_name TEXT NOT NULL,
-    mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
-    file_size INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (paste_slug) REFERENCES pastes(slug) ON DELETE CASCADE
+CREATE TABLE sessions (
+    id TEXT PRIMARY KEY,
+    token_hash BLOB NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    last_seen INTEGER NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_pastes_burn_at ON pastes(burn_at);
-CREATE INDEX IF NOT EXISTS idx_pastes_burn_pending_delete_at ON pastes(burn_pending_delete_at);
-CREATE INDEX IF NOT EXISTS idx_pastes_burn_trigger ON pastes(burn_trigger);
+CREATE TABLE pastes (
+    id TEXT PRIMARY KEY,
+    key_salt BLOB NOT NULL,
+    title_ct BLOB NOT NULL,
+    content_ct BLOB NOT NULL,
+    language_ct BLOB,
+    pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+    burn_mode TEXT CHECK (burn_mode IN ('time', 'unlock_count') OR burn_mode IS NULL),
+    burn_after INTEGER CHECK (burn_after IS NULL OR burn_after > 0),
+    burn_at INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE shares (
+    paste_id TEXT PRIMARY KEY REFERENCES pastes(id) ON DELETE CASCADE,
+    share_salt BLOB NOT NULL,
+    share_auth_key BLOB NOT NULL,
+    wrapped_paste_key BLOB NOT NULL,
+    expires_at INTEGER,
+    revoked_at INTEGER,
+    unlocks_used INTEGER NOT NULL DEFAULT 0 CHECK (unlocks_used >= 0),
+    max_unlocks INTEGER CHECK (max_unlocks IS NULL OR max_unlocks > 0),
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE share_tokens (
+    token_hash BLOB PRIMARY KEY,
+    share_id TEXT NOT NULL REFERENCES shares(paste_id) ON DELETE CASCADE,
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE files (
+    id TEXT PRIMARY KEY,
+    paste_id TEXT NOT NULL REFERENCES pastes(id) ON DELETE CASCADE,
+    enc_meta BLOB NOT NULL,
+    size INTEGER NOT NULL CHECK (size >= 0),
+    disk_name TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX idx_sessions_expires_at ON sessions(expires_at);
+CREATE INDEX idx_pastes_updated_at ON pastes(updated_at);
+CREATE INDEX idx_pastes_burn_at ON pastes(burn_at) WHERE burn_at IS NOT NULL;
+CREATE INDEX idx_shares_expires_at ON shares(expires_at) WHERE expires_at IS NOT NULL;
+CREATE INDEX idx_share_tokens_expires_at ON share_tokens(expires_at);
+CREATE INDEX idx_share_tokens_share_id ON share_tokens(share_id);
+CREATE INDEX idx_files_paste_id ON files(paste_id);

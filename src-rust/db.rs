@@ -1,194 +1,244 @@
-use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
-use std::path::Path;
+use std::str::FromStr;
+use std::time::Duration;
 
-/// Create and return a SQLite connection pool.
-pub async fn init_pool(db_path: &str) -> SqlitePool {
-    let url = format!("sqlite:{db_path}?mode=rwc");
+use sqlx::SqlitePool;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+
+pub const SCHEMA_VERSION: i64 = 1;
+
+const REQUIRED_TABLES: &[&str] = &[
+    "settings",
+    "sessions",
+    "pastes",
+    "shares",
+    "share_tokens",
+    "files",
+];
+
+/// Create a SQLite pool with the settings required by the E2EE backend.
+pub async fn init_pool(db_path: &str) -> Result<SqlitePool, sqlx::Error> {
+    let options = SqliteConnectOptions::from_str(&format!("sqlite:{db_path}"))?
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(5))
+        .foreign_keys(true)
+        .synchronous(SqliteSynchronous::Normal);
 
     SqlitePoolOptions::new()
         .max_connections(5)
-        .connect(&url)
+        .connect_with(options)
         .await
-        .expect("Failed to connect to SQLite database")
 }
 
-async fn table_has_column(pool: &SqlitePool, table: &str, column: &str) -> bool {
-    let query = format!("PRAGMA table_info({table})");
-    match sqlx::query(&query).fetch_all(pool).await {
-        Ok(rows) => rows
-            .iter()
-            .any(|row| row.get::<String, _>("name") == column),
-        Err(e) => {
-            tracing::warn!("Failed to inspect {table} columns: {e}");
-            false
-        }
-    }
+async fn list_user_tables(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT name FROM sqlite_master
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+         ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await
 }
 
-async fn rebuild_pastes_for_burn_rules(pool: &SqlitePool) {
-    tracing::info!("Rebuilding pastes table for Burn Rules migration");
-
-    sqlx::query("PRAGMA foreign_keys = OFF;")
-        .execute(pool)
-        .await
-        .ok();
-
-    let statements = [
-        "DROP TABLE IF EXISTS pastes_new",
-        "CREATE TABLE pastes_new (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            slug TEXT NOT NULL UNIQUE,
-            title TEXT NOT NULL,
-            content TEXT NOT NULL,
-            language TEXT NOT NULL,
-            pinned INTEGER NOT NULL DEFAULT 0,
-            burn_trigger TEXT CHECK (burn_trigger IN ('time', 'unlock_count') OR burn_trigger IS NULL),
-            burn_action TEXT NOT NULL DEFAULT 'delete' CHECK (burn_action IN ('revoke_share', 'delete')),
-            burn_at TEXT,
-            burn_after_unlocks INTEGER,
-            burn_unlocks_used INTEGER NOT NULL DEFAULT 0,
-            burn_pending_delete_at TEXT,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            encrypted_paste_key TEXT NOT NULL,
-            share_wrapped_paste_key TEXT,
-            share_auth_salt TEXT,
-            share_auth_verifier TEXT
-        )",
-        "INSERT INTO pastes_new (
-            id, slug, title, content, language, pinned,
-            burn_trigger, burn_action, burn_at, burn_after_unlocks,
-            burn_unlocks_used, burn_pending_delete_at,
-            created_at, updated_at, encrypted_paste_key,
-            share_wrapped_paste_key, share_auth_salt, share_auth_verifier
-        )
-        SELECT
-            id, slug, title, content, language, pinned,
-            CASE WHEN expires_at IS NOT NULL THEN 'time' ELSE NULL END,
-            'delete',
-            expires_at,
-            NULL,
-            0,
-            NULL,
-            created_at, updated_at, encrypted_paste_key,
-            share_wrapped_paste_key, share_auth_salt, share_auth_verifier
-        FROM pastes",
-        "DROP TABLE pastes",
-        "ALTER TABLE pastes_new RENAME TO pastes",
-    ];
-
-    for stmt in statements {
-        if let Err(e) = sqlx::query(stmt).execute(pool).await {
-            sqlx::query("PRAGMA foreign_keys = ON;")
-                .execute(pool)
-                .await
-                .ok();
-            panic!("Failed Burn Rules table rebuild: {e}\nStatement: {stmt}");
-        }
-    }
-
-    sqlx::query("PRAGMA foreign_keys = ON;")
-        .execute(pool)
-        .await
-        .ok();
-}
-
-/// Run the schema migration (CREATE TABLE IF NOT EXISTS).
-pub async fn run_migrations(pool: &SqlitePool) {
-    // Enable WAL mode for better concurrent read performance
-    sqlx::query("PRAGMA journal_mode = WAL;")
-        .execute(pool)
-        .await
-        .ok();
-
-    sqlx::query("PRAGMA foreign_keys = ON;")
-        .execute(pool)
-        .await
-        .ok();
-
+async fn create_schema(pool: &SqlitePool) -> Result<(), String> {
     let schema = include_str!("../schema.sql");
+    let schema_without_comments = schema
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
 
-    for statement in schema.split(';') {
-        let trimmed = statement.trim();
-        if trimmed.is_empty() || trimmed.starts_with("--") {
+    for statement in schema_without_comments.split(';') {
+        let statement = statement.trim();
+        if statement.is_empty() {
             continue;
         }
-        match sqlx::query(trimmed).execute(pool).await {
-            Ok(_) => {}
-            Err(e) => {
-                let msg = e.to_string();
-                if trimmed.contains("idx_pastes_burn") && msg.contains("no such column") {
-                    // Existing pre-Burn-Rules databases are rebuilt below before
-                    // these indexes are created for real.
-                    continue;
-                }
-                panic!("Failed to run migration: {e}\nStatement: {trimmed}");
-            }
-        }
+        sqlx::query(statement)
+            .execute(pool)
+            .await
+            .map_err(|e| format!("Failed to create schema: {e}\nStatement: {statement}"))?;
     }
 
-    // Clean migration from the old expiration model to Burn Rules. Existing
-    // expiring pastes become time-triggered delete rules; the old column is removed.
-    if table_has_column(pool, "pastes", "expires_at").await {
-        rebuild_pastes_for_burn_rules(pool).await;
-    }
+    sqlx::query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+        .execute(pool)
+        .await
+        .map_err(|e| format!("Failed to set schema version: {e}"))?;
 
-    let alter_statements = [
-        // Drop legacy columns that are no longer used.
-        "ALTER TABLE pastes DROP COLUMN is_file",
-        "ALTER TABLE pastes DROP COLUMN file_name",
-        "ALTER TABLE pastes DROP COLUMN mime_type",
-        "ALTER TABLE pastes DROP COLUMN file_size",
-        "ALTER TABLE pastes DROP COLUMN encrypted_preview",
-        "ALTER TABLE pastes DROP COLUMN shared_encrypted_key",
-        "CREATE INDEX IF NOT EXISTS idx_pastes_burn_at ON pastes(burn_at)",
-        "CREATE INDEX IF NOT EXISTS idx_pastes_burn_pending_delete_at ON pastes(burn_pending_delete_at)",
-        "CREATE INDEX IF NOT EXISTS idx_pastes_burn_trigger ON pastes(burn_trigger)",
-    ];
-
-    for stmt in &alter_statements {
-        match sqlx::query(stmt).execute(pool).await {
-            Ok(_) => tracing::info!("Migration applied: {stmt}"),
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("duplicate column name")
-                    || msg.contains("no such column")
-                    || msg.contains("cannot drop")
-                {
-                    // Column/index state is already compatible enough for this idempotent migration.
-                } else {
-                    tracing::warn!("Migration skipped ({stmt}): {msg}");
-                }
-            }
-        }
-    }
-
-    tracing::info!("Schema migrations applied");
+    Ok(())
 }
 
-/// Ensure a persistent salt file exists in the data directory.
-/// If it doesn't exist, generate 32 random bytes, base64-encode them,
-/// and write to `{data_dir}/salt.txt`. Returns the base64-encoded salt.
-pub fn ensure_salt(data_dir: &str) -> String {
-    let salt_path = Path::new(data_dir).join("salt.txt");
-    if salt_path.exists() {
-        return std::fs::read_to_string(&salt_path)
-            .expect("Failed to read salt.txt")
-            .trim()
-            .to_string();
+async fn drop_all_user_tables(pool: &SqlitePool) -> Result<(), String> {
+    let tables = list_user_tables(pool)
+        .await
+        .map_err(|e| format!("Failed to list tables for reset: {e}"))?;
+
+    let mut connection = pool
+        .acquire()
+        .await
+        .map_err(|e| format!("Failed to acquire database connection for reset: {e}"))?;
+
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *connection)
+        .await
+        .map_err(|e| format!("Failed to disable foreign keys for reset: {e}"))?;
+
+    for table in tables {
+        let quoted = table.replace('"', "\"\"");
+        sqlx::query(&format!("DROP TABLE IF EXISTS \"{quoted}\""))
+            .execute(&mut *connection)
+            .await
+            .map_err(|e| format!("Failed to drop table {table}: {e}"))?;
     }
 
-    use base64::Engine;
-    use rand::Rng;
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&mut *connection)
+        .await
+        .map_err(|e| format!("Failed to re-enable foreign keys after reset: {e}"))?;
 
-    let mut rng = rand::rng();
-    let mut salt_bytes = [0u8; 32];
-    rng.fill(&mut salt_bytes);
-    let salt = base64::engine::general_purpose::STANDARD.encode(salt_bytes);
+    Ok(())
+}
 
-    std::fs::create_dir_all(data_dir).expect("Failed to create data directory for salt");
-    std::fs::write(&salt_path, &salt).expect("Failed to write salt.txt");
-    tracing::info!("Generated new E2EE salt at {}", salt_path.display());
+fn has_required_tables(tables: &[String]) -> bool {
+    REQUIRED_TABLES
+        .iter()
+        .all(|required| tables.iter().any(|table| table == required))
+}
 
-    salt
+/// Create schema v1, or refuse to reuse an incompatible database.
+///
+/// `RESET_DB=1` is the only way to wipe an existing database. There is no
+/// silent `CREATE TABLE IF NOT EXISTS` compatibility path for the old schema.
+pub async fn init_schema(pool: &SqlitePool, reset: bool) -> Result<(), String> {
+    let tables = list_user_tables(pool)
+        .await
+        .map_err(|e| format!("Failed to inspect database schema: {e}"))?;
+
+    let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("Failed to read schema version: {e}"))?;
+
+    if !tables.is_empty() {
+        if version == SCHEMA_VERSION && has_required_tables(&tables) {
+            if reset {
+                tracing::warn!(
+                    "RESET_DB=1 ignored: database schema v{SCHEMA_VERSION} is already current"
+                );
+            }
+            tracing::info!("Database schema is current (version {SCHEMA_VERSION})");
+            return Ok(());
+        }
+
+        if reset {
+            tracing::warn!(
+                "RESET_DB=1: dropping {} incompatible table(s) and creating schema v{}",
+                tables.len(),
+                SCHEMA_VERSION
+            );
+            drop_all_user_tables(pool).await?;
+        } else {
+            return Err(format!(
+                "Existing database schema is not compatible with schema v{SCHEMA_VERSION}.\n\
+                 Found tables: {}\n\
+                 Back up the database, then set RESET_DB=1 once to wipe it.",
+                tables.join(", ")
+            ));
+        }
+    }
+
+    create_schema(pool).await?;
+    tracing::info!("Created database schema version {SCHEMA_VERSION}");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn memory_pool() -> SqlitePool {
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite")
+    }
+
+    #[tokio::test]
+    async fn creates_schema_and_is_idempotent() {
+        let pool = memory_pool().await;
+        init_schema(&pool, false).await.expect("first init");
+        init_schema(&pool, false).await.expect("second init");
+
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        let tables = list_user_tables(&pool).await.unwrap();
+        assert!(has_required_tables(&tables));
+    }
+
+    #[tokio::test]
+    async fn refuses_existing_unknown_schema_without_reset() {
+        let pool = memory_pool().await;
+        sqlx::query("CREATE TABLE legacy (id INTEGER PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let error = init_schema(&pool, false).await.unwrap_err();
+        assert!(error.contains("RESET_DB=1"));
+    }
+
+    #[tokio::test]
+    async fn reset_flag_does_not_wipe_current_schema() {
+        let pool = memory_pool().await;
+        init_schema(&pool, false).await.expect("initial schema");
+
+        sqlx::query(
+            "INSERT INTO settings
+                (id, kdf_salt, kdf_params, auth_hash, wrapped_vault_key, created_at, updated_at)
+             VALUES (1, ?, ?, ?, ?, 0, 0)",
+        )
+        .bind(vec![1u8; 16])
+        .bind("{}")
+        .bind(vec![2u8; 32])
+        .bind(vec![3u8; 60])
+        .execute(&pool)
+        .await
+        .expect("insert settings");
+
+        init_schema(&pool, true)
+            .await
+            .expect("current schema must survive reset flag");
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM settings")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn reset_drops_old_schema_and_creates_v1() {
+        let pool = memory_pool().await;
+        sqlx::query("CREATE TABLE legacy (id INTEGER PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        init_schema(&pool, true).await.expect("reset init");
+
+        let legacy: Option<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'legacy'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert!(legacy.is_none());
+
+        let tables = list_user_tables(&pool).await.unwrap();
+        assert!(has_required_tables(&tables));
+    }
 }

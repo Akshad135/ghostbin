@@ -41,7 +41,7 @@ pub async fn handle_upload(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
-    if !auth::is_authenticated(&headers, &state.auth_key) {
+    if !auth::is_authenticated(&state.db, &headers).await {
         return json_error(StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
 
@@ -157,7 +157,7 @@ pub async fn handle_delete(
     headers: HeaderMap,
     Path(slug): Path<String>,
 ) -> impl IntoResponse {
-    if !auth::is_authenticated(&headers, &state.auth_key) {
+    if !auth::is_authenticated(&state.db, &headers).await {
         return json_error(StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
 
@@ -300,7 +300,7 @@ pub async fn handle_download(
         }
     }
 
-    if !auth::is_authenticated(&headers, &state.auth_key) && !is_publicly_shared {
+    if !auth::is_authenticated(&state.db, &headers).await && !is_publicly_shared {
         return json_error(StatusCode::FORBIDDEN, "This file is private").into_response();
     }
 
