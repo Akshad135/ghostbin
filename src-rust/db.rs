@@ -4,7 +4,7 @@ use std::time::Duration;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 const REQUIRED_TABLES: &[&str] = &[
     "settings",
@@ -12,6 +12,7 @@ const REQUIRED_TABLES: &[&str] = &[
     "pastes",
     "shares",
     "share_tokens",
+    "share_challenges",
     "files",
 ];
 
@@ -104,7 +105,7 @@ fn has_required_tables(tables: &[String]) -> bool {
         .all(|required| tables.iter().any(|table| table == required))
 }
 
-/// Create schema v1, or refuse to reuse an incompatible database.
+/// Create the current schema, or refuse to reuse an incompatible database.
 ///
 /// `RESET_DB=1` is the only way to wipe an existing database. There is no
 /// silent `CREATE TABLE IF NOT EXISTS` compatibility path for the old schema.
@@ -221,7 +222,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reset_drops_old_schema_and_creates_v1() {
+    async fn reset_drops_old_schema_and_creates_current() {
         let pool = memory_pool().await;
         sqlx::query("CREATE TABLE legacy (id INTEGER PRIMARY KEY)")
             .execute(&pool)

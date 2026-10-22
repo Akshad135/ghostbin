@@ -1,4 +1,4 @@
--- GhostBin E2EE schema, version 1.
+-- GhostBin E2EE schema, version 2.
 -- The server never stores plaintext paste content, passphrases, or raw auth keys.
 
 CREATE TABLE settings (
@@ -52,6 +52,13 @@ CREATE TABLE share_tokens (
     created_at INTEGER NOT NULL
 );
 
+CREATE TABLE share_challenges (
+    nonce_hash BLOB PRIMARY KEY,
+    share_id TEXT NOT NULL REFERENCES shares(paste_id) ON DELETE CASCADE,
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
 CREATE TABLE files (
     id TEXT PRIMARY KEY,
     paste_id TEXT NOT NULL REFERENCES pastes(id) ON DELETE CASCADE,
@@ -67,4 +74,6 @@ CREATE INDEX idx_pastes_burn_at ON pastes(burn_at) WHERE burn_at IS NOT NULL;
 CREATE INDEX idx_shares_expires_at ON shares(expires_at) WHERE expires_at IS NOT NULL;
 CREATE INDEX idx_share_tokens_expires_at ON share_tokens(expires_at);
 CREATE INDEX idx_share_tokens_share_id ON share_tokens(share_id);
+CREATE INDEX idx_share_challenges_expires_at ON share_challenges(expires_at);
+CREATE INDEX idx_share_challenges_share_id ON share_challenges(share_id);
 CREATE INDEX idx_files_paste_id ON files(paste_id);

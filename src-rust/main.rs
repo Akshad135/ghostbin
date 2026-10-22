@@ -8,9 +8,8 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 mod auth;
 mod db;
-mod expiry;
+mod envelope;
 mod routes;
-mod slugs;
 mod state;
 
 use state::AppState;
@@ -89,18 +88,33 @@ async fn main() {
         max_file_size / 1_048_576
     );
 
-    // ── Session cleanup ────────────────────────────────────────────────
-    // Burn and orphan-file cleanup move into the paste/file phase, where
-    // they can use the new schema and atomic transactions.
+    if let Err(error) = routes::files::reconcile_uploads(&state).await {
+        tracing::warn!("Upload reconciliation failed: {error}");
+    }
+
+    // ── Periodic cleanup ──────────────────────────────────────────────
+    // Burned pastes and expired share state are swept every minute. Sessions
+    // are swept hourly; they are also rejected inline on every request.
     let cleanup_state = state.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut session_sweep = 0u32;
         loop {
             interval.tick().await;
-            if let Err(error) =
-                auth::delete_expired_sessions(&cleanup_state.db, auth::now_unix()).await
-            {
-                tracing::warn!("Failed to delete expired sessions: {error}");
+            if let Err(error) = routes::pastes::burn_due_pastes(&cleanup_state).await {
+                tracing::warn!("Failed to sweep burned pastes: {error}");
+            }
+            if let Err(error) = routes::shares::cleanup_share_state(&cleanup_state.db).await {
+                tracing::warn!("Failed to clean share state: {error}");
+            }
+            session_sweep += 1;
+            if session_sweep >= 60 {
+                session_sweep = 0;
+                if let Err(error) =
+                    auth::delete_expired_sessions(&cleanup_state.db, auth::now_unix()).await
+                {
+                    tracing::warn!("Failed to delete expired sessions: {error}");
+                }
             }
         }
     });

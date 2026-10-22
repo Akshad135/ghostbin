@@ -6,16 +6,18 @@ use axum::{
 use crate::state::SharedState;
 
 pub mod auth;
-pub mod file;
-pub mod paste;
+pub mod events;
+pub mod files;
+pub mod pastes;
 pub mod ping;
-pub mod stream;
+pub mod shares;
+pub mod util;
 
 /// Build the API sub-router (mounted at `/api`).
 pub fn api_router() -> Router<SharedState> {
     Router::new()
         .route("/ping", get(ping::handle_ping))
-        .route("/stream", get(stream::handle_stream))
+        .route("/events", get(events::handle_events))
         .route("/auth/params", get(auth::handle_params))
         .route("/auth/setup", post(auth::handle_setup))
         .route("/auth/login", post(auth::handle_login))
@@ -25,22 +27,26 @@ pub fn api_router() -> Router<SharedState> {
             post(auth::handle_change_passphrase),
         )
         .route("/vault", get(auth::handle_vault))
-        // Legacy paste/file routes are replaced in the next build phase.
-        .route("/paste", get(paste::handle_list).post(paste::handle_create))
         .route(
-            "/paste/",
-            get(paste::handle_list).post(paste::handle_create),
+            "/pastes",
+            get(pastes::handle_list).post(pastes::handle_create),
         )
         .route(
-            "/paste/{slug}",
-            get(paste::handle_get)
-                .put(paste::handle_update)
-                .delete(paste::handle_delete),
+            "/pastes/{id}",
+            get(pastes::handle_get)
+                .put(pastes::handle_update)
+                .delete(pastes::handle_delete),
         )
-        .route("/paste/{slug}/unlock", post(paste::handle_unlock))
-        .route("/file/upload", post(file::handle_upload))
         .route(
-            "/file/{slug}",
-            get(file::handle_download).delete(file::handle_delete),
+            "/pastes/{id}/share",
+            get(shares::handle_status)
+                .post(shares::handle_create)
+                .delete(shares::handle_delete),
         )
+        .route("/files", post(files::handle_upload))
+        .route("/files/{id}", get(files::handle_download))
+        .route("/shares/{id}/params", get(shares::handle_params))
+        .route("/shares/{id}/challenge", post(shares::handle_challenge))
+        .route("/shares/{id}/unlock", post(shares::handle_unlock))
+        .route("/shares/{id}/view", post(shares::handle_view))
 }
