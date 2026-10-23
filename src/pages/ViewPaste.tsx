@@ -379,6 +379,9 @@ export function ViewPaste() {
         setMissingFileCount(0);
         setAllowMissingFiles(false);
         setCode('');
+        // A vault login mid-unlock invalidates the in-flight attempt without
+        // running its finally block; without this the form stays disabled.
+        setUnlocking(false);
 
         if (!rawHash) {
             setPage('private');

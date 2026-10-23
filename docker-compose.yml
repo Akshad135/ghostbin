@@ -38,3 +38,7 @@ services:
 
 volumes:
   ghostbin-data:
+    # Pinned name: compose prefixes declared volumes with the project name
+    # (e.g. pastebin_ghostbin-data), which would break the README's
+    # `podman volume inspect ghostbin-data` backup instructions.
+    name: ghostbin-data

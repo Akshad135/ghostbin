@@ -265,18 +265,26 @@ async fn fetch_paste(
 
 /// Delete a paste, its share and files, and the on-disk file bodies.
 pub async fn delete_paste(state: &Arc<AppState>, paste_id: &str) -> Result<bool, sqlx::Error> {
+    // Collect file names and delete the row in one write transaction: a
+    // file upload committing between two loose statements would cascade-
+    // delete its files row after the names were read, leaving the
+    // encrypted body stranded on disk past the burn.
+    let mut transaction = state.db.begin_with("BEGIN IMMEDIATE").await?;
     let disk_names: Vec<String> =
         sqlx::query_scalar("SELECT disk_name FROM files WHERE paste_id = ?")
             .bind(paste_id)
-            .fetch_all(&state.db)
+            .fetch_all(&mut *transaction)
             .await?;
 
-    let result = sqlx::query("DELETE FROM pastes WHERE id = ?")
+    let deleted = sqlx::query("DELETE FROM pastes WHERE id = ?")
         .bind(paste_id)
-        .execute(&state.db)
-        .await?;
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected()
+        > 0;
+    transaction.commit().await?;
 
-    if result.rows_affected() == 0 {
+    if !deleted {
         return Ok(false);
     }
 
@@ -676,9 +684,18 @@ pub async fn handle_update(
     .execute(&state.db)
     .await;
 
-    if let Err(error) = result {
-        tracing::error!("Failed to update paste: {error}");
-        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", "Database error");
+    match result {
+        Ok(result) if result.rows_affected() == 1 => {}
+        // Zero rows: the paste vanished between the fetch above and this
+        // UPDATE (concurrent delete or burn sweep). Report the miss
+        // instead of acknowledging a save that never landed.
+        Ok(_) => {
+            return api_error(StatusCode::NOT_FOUND, "PASTE_NOT_FOUND", "Paste not found");
+        }
+        Err(error) => {
+            tracing::error!("Failed to update paste: {error}");
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", "Database error");
+        }
     }
 
     let summary = PasteSummary {
