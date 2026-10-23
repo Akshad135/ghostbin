@@ -12,9 +12,6 @@ dist
 dist-ssr
 *.local
 
-# Cloudflare
-.wrangler
-.dev.vars
 .env
 .env.local
 

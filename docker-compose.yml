@@ -30,7 +30,10 @@ services:
       - MAX_TEXT_SIZE=${MAX_TEXT_SIZE:-524288}
       # Maximum size (bytes) for a single file attachment. Default: 52428800 (50 MB).
       - MAX_FILE_SIZE=${MAX_FILE_SIZE:-52428800}
-      - RUST_LOG=info
+      # Database wipe control: 1 = wipe incompatible schema, force = wipe even
+      # the current schema. DANGER: destroys all data.
+      - RESET_DB=${RESET_DB:-0}
+      - RUST_LOG=${RUST_LOG:-info}
     restart: unless-stopped
 
 volumes:

@@ -1,8 +1,9 @@
 # Never send local secrets/state into the Docker build context.
 .env
 .env.local
-.dev.vars
 data/
+backups/
+*.sqlite
 
 # VCS / editor
 .git

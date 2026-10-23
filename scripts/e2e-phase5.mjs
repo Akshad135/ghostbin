@@ -3,15 +3,15 @@
  * Phase-5 live checks: security headers, HSTS opt-in, X-Forwarded-For
  * handling, exponential share-unlock lockout, and no-store caching.
  *
- * Start two FRESH throwaway servers (RESET_DB=1 wipes them):
+ * Start two FRESH throwaway servers (RESET_DB=force wipes them):
  *
  *   # plain server (no trusted proxies, no HSTS)
  *   DATABASE_PATH=/tmp/gb-e2e/plain.sqlite UPLOADS_DIR=/tmp/gb-e2e/plain-uploads \
- *   RESET_DB=1 PORT=8799 BIND_ADDR=127.0.0.1 cargo run
+ *   RESET_DB=force PORT=8799 BIND_ADDR=127.0.0.1 cargo run
  *
  *   # proxied server (trusts the local proxy, HSTS on)
  *   DATABASE_PATH=/tmp/gb-e2e/proxied.sqlite UPLOADS_DIR=/tmp/gb-e2e/proxied-uploads \
- *   RESET_DB=1 PORT=8798 BIND_ADDR=127.0.0.1 TRUSTED_PROXIES=127.0.0.1 \
+ *   RESET_DB=force PORT=8798 BIND_ADDR=127.0.0.1 TRUSTED_PROXIES=127.0.0.1 \
  *   HSTS_ENABLED=1 cargo run
  *
  * Then:

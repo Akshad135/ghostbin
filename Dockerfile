@@ -7,6 +7,12 @@ WORKDIR /app
 # Install dependencies
 COPY package.json package-lock.json* ./
 ARG TARGETPLATFORM
+# Client-side size limits are enforced with build-time values; pass matching
+# ones here when the server limits are raised (see .env.example).
+ARG VITE_MAX_TEXT_SIZE
+ARG VITE_MAX_FILE_SIZE
+ENV VITE_MAX_TEXT_SIZE=${VITE_MAX_TEXT_SIZE}
+ENV VITE_MAX_FILE_SIZE=${VITE_MAX_FILE_SIZE}
 RUN --mount=type=cache,target=/root/.npm,id=npm-${TARGETPLATFORM} \
     npm ci || npm install
 
@@ -32,13 +38,13 @@ COPY schema.sql ./
 ARG TARGETPLATFORM
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETPLATFORM} \
     --mount=type=cache,target=/app/target,id=cargo-target-${TARGETPLATFORM} \
-    cargo build --release && \
+    cargo build --release --locked && \
     cp /app/target/release/ghostbin-server /app/ghostbin-server_built
 
 # ==============================================================================
 # Stage 3: Final runtime image
 # ==============================================================================
-FROM alpine:3.19
+FROM alpine:3.22
 WORKDIR /app
 
 RUN apk add --no-cache sqlite-libs libgcc

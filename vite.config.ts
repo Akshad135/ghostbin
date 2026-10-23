@@ -87,7 +87,7 @@ export default defineConfig(({ mode }) => {
             })
             proxy.on('error', (err, _req, res) => {
               const code = (err as NodeJS.ErrnoException).code
-              console.warn(`\x1b[33m[api] Backend unavailable (${code || err.message}) — is dev:api running?\x1b[0m`)
+              console.warn(`\x1b[33m[api] Backend unavailable (${code || err.message}) — is dev:backend running?\x1b[0m`)
               if (res && 'writeHead' in res && !res.headersSent) {
                 const response = res as ServerResponse
                 response.writeHead(502, { 'Content-Type': 'application/json' })

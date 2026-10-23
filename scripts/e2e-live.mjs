@@ -6,7 +6,7 @@
  * Start a throwaway server first, e.g.:
  *
  *   DATABASE_PATH=/tmp/gb-e2e/test.sqlite UPLOADS_DIR=/tmp/gb-e2e/uploads \
- *   RESET_DB=1 PORT=8791 cargo run
+ *   RESET_DB=force PORT=8791 cargo run
  *
  * Then:
  *
