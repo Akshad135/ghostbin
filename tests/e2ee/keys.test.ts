@@ -15,6 +15,8 @@ import {
   isPasteId,
   randomBytes,
   unwrapVaultKey,
+  vaultCanary,
+  vaultStamp,
   wrapVaultKey,
 } from "../../src/lib/e2ee/index.ts";
 
@@ -122,4 +124,29 @@ test("generated IDs have the expected format", () => {
   assert.equal(isFileId(fileId), true);
   assert.equal(pasteId.length, 22);
   assert.equal(fileId.length, 22);
+});
+
+test("vault canary is deterministic per key and differs across keys", async () => {
+  const vaultKeyA = await importVaultKey(generateVaultKey());
+  const vaultKeyB = await importVaultKey(generateVaultKey());
+
+  const canaryA1 = await vaultCanary(vaultKeyA);
+  const canaryA2 = await vaultCanary(vaultKeyA);
+  const canaryB = await vaultCanary(vaultKeyB);
+
+  assert.equal(canaryA1, canaryA2);
+  assert.notEqual(canaryA1, canaryB);
+  assert.match(canaryA1, /^[A-Za-z0-9_-]+$/);
+});
+
+test("vault stamp tracks the wrapped vault key envelope", async () => {
+  const salt = randomBytes(16);
+  const masterKey = await deriveMasterKey(
+    await deriveRootKey("passphrase", salt, FAST_ARGON2),
+  );
+  const envelopeA = await wrapVaultKey(masterKey, generateVaultKey());
+  const envelopeB = await wrapVaultKey(masterKey, generateVaultKey());
+
+  assert.equal(await vaultStamp(envelopeA), await vaultStamp(envelopeA));
+  assert.notEqual(await vaultStamp(envelopeA), await vaultStamp(envelopeB));
 });

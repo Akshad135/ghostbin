@@ -20,4 +20,17 @@ export default defineConfig([
       globals: globals.browser,
     },
   },
+  {
+    // shadcn-style components export variants alongside components, and
+    // context providers export their hooks. The fast-refresh rule is an
+    // HMR nicety, not a correctness constraint, for these files.
+    files: [
+      'src/components/ui/**/*.{ts,tsx}',
+      'src/components/ThemeProvider.tsx',
+      'src/lib/auth.tsx',
+    ],
+    rules: {
+      'react-refresh/only-export-components': 'off',
+    },
+  },
 ])

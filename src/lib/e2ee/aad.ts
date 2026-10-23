@@ -65,6 +65,16 @@ export function fileChunkAad(
   ].join("|");
 }
 
+export function fileMetaAad(pasteId: string, fileId: string): string {
+  if (!isPasteId(pasteId)) {
+    throw new Error("fileMetaAad: invalid paste ID");
+  }
+  if (!isFileId(fileId)) {
+    throw new Error("fileMetaAad: invalid file ID");
+  }
+  return `ghostbin/file-meta/v1|${pasteId}|${fileId}`;
+}
+
 export function shareAad(pasteId: string, shareSalt: Uint8Array): string {
   if (!isPasteId(pasteId)) {
     throw new Error("shareAad: invalid paste ID");

@@ -1,11 +1,24 @@
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useAuth } from '@/lib/auth';
-import { useOffline } from '@/lib/offlineContext';
-import { api, type Paste } from '@/lib/api';
-import { unwrapPasteKey, decryptText, encryptText, encryptBytes } from '@/lib/crypto';
-import { LANGUAGES, validateBurnRule, type BurnAction, type BurnUnit } from '@/lib/constants';
+import { api, ApiError, type PasteDetail, type FileMeta } from '@/lib/api';
+import {
+    decryptAttachmentBytes,
+    decryptAttachmentMeta,
+    decryptPasteWithKey,
+    encryptNewAttachment,
+    encryptPasteFields,
+    pasteKeyForSummary,
+    type AttachmentMeta,
+    type EncryptedAttachment,
+} from '@/lib/paste';
 import { config } from '@/lib/config';
+import { toArrayBuffer } from '@/lib/e2ee';
+import {
+    LANGUAGES,
+    validateBurnRule,
+    type BurnUnit,
+} from '@/lib/constants';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -13,575 +26,611 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
-import { Skeleton } from '@/components/ui/skeleton';
-import {
-    Dialog,
-    DialogContent,
-    DialogHeader,
-    DialogTitle,
-    DialogDescription,
-    DialogFooter,
-    DialogClose,
-} from '@/components/ui/dialog';
 import { ArrowLeftIcon } from '@/components/ui/animated-arrow-left';
-
-import { DeleteIcon } from '@/components/ui/animated-delete';
 import { LoaderPinwheelIcon } from '@/components/ui/animated-loader-pinwheel';
-import { BadgeAlertIcon } from '@/components/ui/animated-badge-alert';
 import { PinIcon } from '@/components/ui/animated-pin';
 import { UploadIcon } from '@/components/ui/animated-upload';
+import { DeleteIcon } from '@/components/ui/animated-delete';
 import { FileTextIcon } from '@/components/ui/animated-file-text';
+import { LockIcon } from '@/components/ui/animated-lock';
+import { DownloadIcon } from '@/components/ui/animated-download';
 import { BurnRulesControl } from '@/components/BurnRulesControl';
-import { cn, truncateFileName, formatFileSize } from '@/lib/utils';
+import { ErrorState } from '@/components/ErrorState';
+import {
+    Dialog,
+    DialogClose,
+    DialogContent,
+    DialogDescription,
+    DialogFooter,
+    DialogHeader,
+    DialogTitle,
+} from '@/components/ui/dialog';
+import { cn, formatFileSize, truncateFileName } from '@/lib/utils';
 import { toast } from 'sonner';
 
-// When editing a paste that already has a time-based burn, we do NOT
-// reverse-engineer the remaining seconds back into a duration because that
-// would cause the user to accidentally shrink the burn window on every save
-// (e.g. a 1-day paste edited 12 hours later would re-submit "12 hours").
-// Instead we leave the value blank and show a warning in the UI.
-function inferBurnTimeFields(burnAt: string | null): { value: string; unit: BurnUnit; isPast: boolean } {
-    if (!burnAt) return { value: '', unit: 'hour', isPast: false };
-    const remaining = new Date(burnAt + 'Z').getTime() - Date.now();
-    if (remaining <= 0) return { value: '', unit: 'minute', isPast: true };
-    // Return blank value — the UI will show a notice about the existing deadline
-    return { value: '', unit: 'hour', isPast: false };
+interface ExistingFile {
+    meta: FileMeta;
+    plain: AttachmentMeta;
 }
 
-interface Attachment {
-    slug?: string;
-    file_name: string;
-    file_size: number;
-    mime_type: string;
-    uploading: boolean;
-    error?: string;
-    isNew?: boolean; // to differentiate newly uploaded vs existing
+interface StagedFile {
+    key: string;
+    file: File;
+}
+
+function burnDisplay(paste: PasteDetail): {
+    trigger: string;
+    value: string;
+    unit: BurnUnit;
+    unlocks: string;
+} {
+    if (paste.burnMode === 'time' && paste.burnAt) {
+        const remaining = Math.max(60, paste.burnAt - Math.floor(Date.now() / 1000));
+        if (remaining >= 86400) {
+            return {
+                trigger: 'time',
+                value: String(Math.max(1, Math.round(remaining / 86400))),
+                unit: 'day',
+                unlocks: '3',
+            };
+        }
+        if (remaining >= 3600) {
+            return {
+                trigger: 'time',
+                value: String(Math.max(1, Math.round(remaining / 3600))),
+                unit: 'hour',
+                unlocks: '3',
+            };
+        }
+        return {
+            trigger: 'time',
+            value: String(Math.max(1, Math.round(remaining / 60))),
+            unit: 'minute',
+            unlocks: '3',
+        };
+    }
+    if (paste.burnMode === 'unlock_count' && paste.burnAfter != null) {
+        return {
+            trigger: 'unlock_count',
+            value: '24',
+            unit: 'hour',
+            unlocks: String(paste.burnAfter),
+        };
+    }
+    return { trigger: 'off', value: '24', unit: 'hour', unlocks: '3' };
 }
 
 export function EditPaste() {
-    const { slug } = useParams<{ slug: string }>();
-    const { isAuthenticated, masterKey, isLoading: authLoading } = useAuth();
-    const { isEffectivelyOffline } = useOffline();
+    const { id } = useParams<{ id: string }>();
     const navigate = useNavigate();
+    const { isAuthenticated, vaultKey, isLoading: authLoading } = useAuth();
 
-    const [paste, setPaste] = useState<Paste | null>(null);
-    const [loading, setLoading] = useState(true);
-    const [saving, setSaving] = useState(false);
-    const [error, setError] = useState('');
-    const [deleteOpen, setDeleteOpen] = useState(false);
+    const [paste, setPaste] = useState<PasteDetail | null>(null);
     const [pasteKey, setPasteKey] = useState<CryptoKey | null>(null);
-
-    // Form state
+    const [existingFiles, setExistingFiles] = useState<ExistingFile[]>([]);
+    const [stagedFiles, setStagedFiles] = useState<StagedFile[]>([]);
+    const [hasShare, setHasShare] = useState(false);
+    const [loading, setLoading] = useState(true);
+    const [notFound, setNotFound] = useState(false);
     const [title, setTitle] = useState('');
     const [content, setContent] = useState('');
     const [language, setLanguage] = useState('plaintext');
-
     const [isPinned, setIsPinned] = useState(false);
     const [burnTrigger, setBurnTrigger] = useState('off');
-    const [burnValue, setBurnValue] = useState('');
+    const [burnValue, setBurnValue] = useState('24');
     const [burnUnit, setBurnUnit] = useState<BurnUnit>('hour');
-    const [burnUnlocks, setBurnUnlocks] = useState('1');
-    const [burnAction, setBurnAction] = useState<BurnAction>('delete');
-    const [burnTimeWarning, setBurnTimeWarning] = useState<string | null>(null);
-    // Tracks the action that was loaded from the server so we can detect
-    // whether the user changed it while leaving burnValue blank.
-    const [originalBurnAction, setOriginalBurnAction] = useState<BurnAction>('delete');
-
-    // Attachments state
-    const [attachments, setAttachments] = useState<Attachment[]>([]);
-    const [removedSlugs, setRemovedSlugs] = useState<string[]>([]);
+    const [unlockValue, setUnlockValue] = useState('3');
+    const [burnDirty, setBurnDirty] = useState(false);
+    const [saving, setSaving] = useState(false);
+    const [busyLabel, setBusyLabel] = useState('');
+    const [deleteOpen, setDeleteOpen] = useState(false);
+    const [deleting, setDeleting] = useState(false);
     const [isDragOver, setIsDragOver] = useState(false);
-    const [uploadDialogOpen, setUploadDialogOpen] = useState(false);
-    const fileInputRef = useRef<HTMLInputElement>(null);
+    const [reloadKey, setReloadKey] = useState(0);
 
     useEffect(() => {
-        if (authLoading) return; // Wait until session restore is complete
+        if (authLoading) return;
         if (!isAuthenticated) {
             navigate('/');
             return;
         }
-        if (!slug) return;
-        loadPaste();
-    // masterKey is included: during session restore isAuthenticated flips to
-    // true before the key is available from IndexedDB. When masterKey
-    // arrives the effect re-runs and retries the load successfully.
-    }, [slug, isAuthenticated, masterKey, authLoading]);
+        if (!vaultKey || !id) return;
 
-    const loadPaste = async () => {
-        setLoading(true);
-        setError('');
-        // Reset attachment state before loading so that switching between
-        // /edit/:slug routes never carries over files or queued removals from
-        // the previously-viewed paste (React Router reuses this component).
-        setAttachments([]);
-        setRemovedSlugs([]);
-        try {
-            const result = await api.paste.get(slug!);
-            const p = result.paste;
-            setPaste(p);
-            
-            let key: CryptoKey | null = null;
-            if (isAuthenticated && p.encrypted_paste_key) {
-                key = await unwrapPasteKey(masterKey!, p.encrypted_paste_key);
-            }
-            if (!key) throw new Error("Could not decrypt paste for editing");
-            setPasteKey(key);
+        let cancelled = false;
+        const load = async () => {
+            setLoading(true);
+            try {
+                const detail = await api.pastes.get(id);
+                const status = await api.share.status(id).catch(() => ({ exists: false as const }));
+                const key = await pasteKeyForSummary(vaultKey, detail);
+                const fields = await decryptPasteWithKey(key, detail);
+                const files = await Promise.all(
+                    detail.files.map(async (file) => ({
+                        meta: file,
+                        plain: await decryptAttachmentMeta(key, id, file),
+                    })),
+                );
+                if (cancelled) return;
 
-            const decTitle = p.title ? await decryptText(key, p.title) : '';
-            const decContent = p.content ? await decryptText(key, p.content) : '';
-            
-            setTitle(decTitle);
-            setContent(decContent);
-            setLanguage(p.language || 'plaintext');
-
-            setIsPinned(p.pinned === 1);
-            setBurnTrigger(p.burn_trigger || 'off');
-            const resolvedAction: BurnAction =
-                (p.burn_action as BurnAction) ||
-                (p.burn_trigger === 'unlock_count' ? 'revoke_share' : 'delete');
-            setBurnAction(resolvedAction);
-            setOriginalBurnAction(resolvedAction);
-            const burnTime = inferBurnTimeFields(p.burn_at);
-            setBurnValue(burnTime.value);
-            setBurnUnit(burnTime.unit);
-            setBurnUnlocks(String(p.burn_after_unlocks || 1));
-            
-            if (p.burn_trigger === 'time' && p.burn_at) {
-                const remaining = new Date(p.burn_at + 'Z').getTime() - Date.now();
-                if (remaining > 0) {
-                    const d = new Date(p.burn_at + 'Z');
-                    setBurnTimeWarning(
-                        `This paste already burns at ${d.toLocaleString()}. Changing the burn value below will set a new deadline from now.`
-                    );
+                const burn = burnDisplay(detail);
+                setPaste(detail);
+                setPasteKey(key);
+                setExistingFiles(files);
+                setTitle(fields.title);
+                setContent(fields.content);
+                setLanguage(fields.language);
+                setIsPinned(detail.pinned);
+                setBurnTrigger(burn.trigger);
+                setBurnValue(burn.value);
+                setBurnUnit(burn.unit);
+                setUnlockValue(burn.unlocks);
+                setBurnDirty(false);
+                setHasShare(status.exists);
+                setNotFound(false);
+            } catch (error) {
+                if (cancelled) return;
+                if (error instanceof ApiError && (error.status === 404 || error.status === 410)) {
+                    setNotFound(true);
                 } else {
-                    setBurnTimeWarning(null);
+                    toast.error(error instanceof Error ? error.message : 'Failed to load paste');
                 }
-            } else {
-                setBurnTimeWarning(null);
+            } finally {
+                if (!cancelled) setLoading(false);
             }
-            
-            const existingFiles = result.files;
-            if (existingFiles && existingFiles.length > 0) {
-                const decAttachments = await Promise.all(existingFiles.map(async f => ({
-                    slug: f.slug,
-                    file_name: await decryptText(key!, f.file_name),
-                    file_size: f.file_size,
-                    mime_type: await decryptText(key!, f.mime_type),
-                    uploading: false,
-                    isNew: false
-                })));
-                setAttachments(decAttachments);
+        };
+        void load();
+        return () => { cancelled = true; };
+    }, [id, isAuthenticated, vaultKey, authLoading, navigate, reloadKey]);
+
+    const existingSize = existingFiles.reduce((sum, file) => sum + file.meta.size, 0);
+    const stagedEstimate = stagedFiles.reduce((sum, file) => sum + file.file.size + 28, 0);
+
+    const addFiles = (files: FileList | File[]) => {
+        const incoming = Array.from(files);
+        if (incoming.length === 0) return;
+
+        let total = existingSize + stagedEstimate;
+        const accepted: StagedFile[] = [];
+        for (const file of incoming) {
+            const encryptedSize = file.size + 28;
+            if (encryptedSize > config.maxFileSize) {
+                toast.error(
+                    `${file.name} is too large. Maximum file size is about ${formatFileSize(config.maxFileSize - 28)}.`,
+                );
+                continue;
             }
-        } catch (err) {
-            setError(err instanceof Error ? err.message : 'Failed to load paste');
-        } finally {
-            setLoading(false);
+            if (total + encryptedSize > config.maxFileSize) {
+                toast.error(
+                    `Attachment quota is ${formatFileSize(config.maxFileSize)} per paste.`,
+                );
+                break;
+            }
+            total += encryptedSize;
+            accepted.push({
+                key: `${file.name}-${file.size}-${file.lastModified}-${Math.random()}`,
+                file,
+            });
+        }
+        if (accepted.length > 0) {
+            setStagedFiles((previous) => [...previous, ...accepted]);
         }
     };
 
-    const handleSave = async (e: React.FormEvent) => {
-        e.preventDefault();
+    const handleFileInput = (event: React.ChangeEvent<HTMLInputElement>) => {
+        if (event.target.files) addFiles(event.target.files);
+        event.target.value = '';
+    };
 
-        if (isEffectivelyOffline) {
-            toast.error('You are offline. Please reconnect to save changes.');
+    const handleDrop = (event: React.DragEvent<HTMLDivElement>) => {
+        event.preventDefault();
+        setIsDragOver(false);
+        if (event.dataTransfer.files.length > 0) addFiles(event.dataTransfer.files);
+    };
+
+    const removeStaged = (key: string) => {
+        setStagedFiles((previous) => previous.filter((file) => file.key !== key));
+    };
+
+    const save = async (event: React.FormEvent) => {
+        event.preventDefault();
+        if (!paste || !pasteKey || !vaultKey || !id) return;
+        if (burnDirty && hasShare) {
+            toast.error('Revoke the existing share before changing burn rules');
             return;
         }
-
-        if (attachments.some(a => a.uploading)) {
-            toast.error('Please wait for files to finish uploading');
-            return;
-        }
-
-        if (!content.trim() && attachments.length === 0) {
-            toast.error('Please provide some content or attach a file');
-            return;
-        }
-
-        // If the trigger is 'time' but burnValue is blank, the user hasn't changed
-        // the existing deadline (inferBurnTimeFields returns '' intentionally).
-        // Skip validation and don't send burn fields so the backend preserves the
-        // existing burn_at unchanged.
-        // If the user changed the burn action while leaving burnValue blank we must
-        // NOT silently drop the action change — turn off keepExistingTimeBurn so
-        // validation fires and asks the user to re-enter the time.
-        const keepExistingTimeBurn =
-            burnTrigger === 'time' && burnValue === '' && burnAction === originalBurnAction;
-        if (!keepExistingTimeBurn) {
-            const burnError = validateBurnRule(burnTrigger, burnValue, burnUnit, burnUnlocks);
+        if (burnDirty) {
+            const burnError = validateBurnRule(burnTrigger, burnValue, burnUnit, unlockValue);
             if (burnError) {
                 toast.error(burnError);
                 return;
             }
         }
+        const contentBytes = new TextEncoder().encode(content).byteLength;
+        if (contentBytes > config.maxTextSize) {
+            toast.error(`Text is too large. Maximum is ${formatFileSize(config.maxTextSize)}.`);
+            return;
+        }
 
         setSaving(true);
         try {
-            if (!pasteKey) throw new Error("Encryption key missing");
+            setBusyLabel('Encrypting…');
+            const fields = await encryptPasteFields(pasteKey, id, {
+                title,
+                content,
+                language,
+            });
 
-            const contentBytes = new Blob([content]).size;
-            if (contentBytes > config.maxTextSize) {
-                toast.error(`Text content is too large (${(contentBytes / 1024).toFixed(1)} KB). Maximum is ${config.maxTextSize / 1024} KB. Please attach large content as a file instead.`);
+            const update: Parameters<typeof api.pastes.update>[1] = {
+                titleCt: fields.titleCt,
+                contentCt: fields.contentCt,
+                languageCt: fields.languageCt,
+                pinned: isPinned,
+            };
+            if (burnDirty) {
+                if (burnTrigger === 'time') {
+                    const multiplier = burnUnit === 'minute' ? 60 : burnUnit === 'hour' ? 3600 : 86400;
+                    update.burnMode = 'time';
+                    update.burnAfterSeconds = Number(burnValue) * multiplier;
+                } else if (burnTrigger === 'unlock_count') {
+                    update.burnMode = 'unlock_count';
+                    update.burnAfter = Number(unlockValue);
+                } else {
+                    update.burnMode = 'none';
+                }
+            }
+
+            // Encrypt new attachments before persisting the text edit. If
+            // local encryption fails, the paste stays unchanged.
+            const prepared: EncryptedAttachment[] = [];
+            for (const staged of stagedFiles) {
+                const bytes = new Uint8Array(await staged.file.arrayBuffer());
+                prepared.push(await encryptNewAttachment(pasteKey, id, {
+                    name: staged.file.name,
+                    mime: staged.file.type || 'application/octet-stream',
+                    bytes,
+                }));
+            }
+            const totalSize = existingSize + prepared.reduce(
+                (sum, attachment) => sum + attachment.encrypted.byteLength,
+                0,
+            );
+            if (totalSize > config.maxFileSize) {
+                throw new Error('The encrypted attachments exceed the per-paste quota');
+            }
+
+            await api.pastes.update(id, update);
+
+            let failed = 0;
+            for (let index = 0; index < prepared.length; index += 1) {
+                const attachment = prepared[index];
+                setBusyLabel(`Uploading file ${index + 1} of ${prepared.length}…`);
+                try {
+                    await api.files.upload({
+                        pasteId: id,
+                        fileId: attachment.fileId,
+                        encrypted: attachment.encrypted,
+                        encMeta: attachment.encMeta,
+                    });
+                } catch {
+                    failed += 1;
+                }
+            }
+
+            if (failed > 0) {
+                toast.error(
+                    `Saved, but ${failed} file${failed === 1 ? '' : 's'} failed to upload. Add the missing file${failed === 1 ? '' : 's'} again.`,
+                );
+                setStagedFiles([]);
+                setReloadKey((value) => value + 1);
                 return;
             }
 
-            const new_file_slugs = attachments
-                .filter(a => a.isNew && !a.error && a.slug)
-                .map(a => a.slug as string);
-
-            const encTitle = title.trim() ? await encryptText(pasteKey, title.trim()) : '';
-            const encContent = content ? await encryptText(pasteKey, content) : '';
-
-            // Build burn fields: omit them entirely when the user left an existing
-            // time-based deadline unchanged (blank burnValue) so the backend
-            // treats it as "no change" and keeps the current burn_at.
-            const burnFields = keepExistingTimeBurn
-                ? {}
-                : {
-                    burn_trigger: burnTrigger === 'off' ? null : burnTrigger as 'time' | 'unlock_count',
-                    burn_action: burnAction,
-                    burn_after_value: burnTrigger === 'time' ? Number(burnValue) : undefined,
-                    burn_after_unit: burnTrigger === 'time' ? burnUnit : undefined,
-                    burn_after_unlocks: burnTrigger === 'unlock_count' ? Number(burnUnlocks) : undefined,
-                };
-
-            await api.paste.update(slug!, {
-                title: encTitle,
-                content: encContent,
-                language,
-                pinned: isPinned ? 1 : 0,
-                ...burnFields,
-                new_file_slugs,
-                removed_file_slugs: removedSlugs,
-            });
-            
-            toast.success('Paste updated!');
-            navigate(`/paste/${slug}`);
-        } catch (err) {
-            toast.error(err instanceof Error ? err.message : 'Failed to update paste');
+            toast.success('Paste updated');
+            navigate(`/p/${id}`);
+        } catch (error) {
+            toast.error(error instanceof Error ? error.message : 'Failed to update paste');
         } finally {
             setSaving(false);
+            setBusyLabel('');
         }
     };
 
-    const handleDelete = async () => {
+    const revokeShare = async () => {
+        if (!id) return;
         try {
-            await api.paste.delete(slug!);
+            await api.share.delete(id);
+            setHasShare(false);
+            toast.success('Share revoked');
+        } catch (error) {
+            toast.error(error instanceof Error ? error.message : 'Failed to revoke share');
+        }
+    };
+
+    const downloadExisting = async (file: ExistingFile) => {
+        if (!pasteKey || !id) return;
+        try {
+            const encrypted = await api.files.download(file.meta.id);
+            const plain = await decryptAttachmentBytes(
+                pasteKey,
+                id,
+                file.meta.id,
+                encrypted,
+                file.plain.size,
+            );
+            const blob = new Blob([toArrayBuffer(plain)], { type: file.plain.mime });
+            const url = URL.createObjectURL(blob);
+            const anchor = document.createElement('a');
+            anchor.href = url;
+            anchor.download = file.plain.name;
+            anchor.click();
+            window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+        } catch (error) {
+            toast.error(error instanceof Error ? error.message : 'Failed to download file');
+        }
+    };
+
+    const deletePaste = async () => {
+        if (!id) return;
+        setDeleting(true);
+        try {
+            await api.pastes.delete(id);
             toast.success('Paste deleted');
             navigate('/');
-        } catch {
-            toast.error('Failed to delete');
+        } catch (error) {
+            toast.error(error instanceof Error ? error.message : 'Failed to delete paste');
+        } finally {
+            setDeleting(false);
         }
     };
 
-    const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-        if (e.key === 'Tab') {
-            e.preventDefault();
-            const target = e.target as HTMLTextAreaElement;
-            const start = target.selectionStart;
-            const end = target.selectionEnd;
-            const value = target.value;
-            const newValue = value.substring(0, start) + '  ' + value.substring(end);
-            setContent(newValue);
-            requestAnimationFrame(() => {
-                target.selectionStart = target.selectionEnd = start + 2;
-            });
-        }
-    };
-
-    const processFiles = async (files: FileList) => {
-        if (isEffectivelyOffline) {
-            toast.error('You are offline. File uploads require a connection.');
-            return;
-        }
-        if (!pasteKey) {
-            toast.error('Encryption key not ready');
-            return;
-        }
-
-        const newFiles = Array.from(files);
-        if (newFiles.length === 0) return;
-
-        for (const file of newFiles) {
-            const attachment: Attachment = {
-                file_name: file.name,
-                file_size: file.size,
-                mime_type: file.type || 'application/octet-stream',
-                uploading: true,
-                isNew: true,
-            };
-
-            setAttachments(prev => [...prev, attachment]);
-
-            try {
-                const encName = await encryptText(pasteKey, file.name);
-                const encMime = await encryptText(pasteKey, file.type || 'application/octet-stream');
-                const encBytes = await encryptBytes(pasteKey, await file.arrayBuffer());
-                const encBlob = new Blob([encBytes]);
-
-                const res = await api.file.upload(encBlob, encName, encMime);
-                setAttachments(prev => prev.map(a =>
-                    a === attachment ? { ...a, uploading: false, slug: res.slug } : a
-                ));
-                toast.success(`Uploaded ${file.name}`);
-            } catch (err) {
-                setAttachments(prev => prev.map(a =>
-                    a === attachment ? { ...a, uploading: false, error: (err as Error).message } : a
-                ));
-                toast.error(`Failed to upload ${file.name}`);
-            }
-        }
-    };
-
-    const handleFileDrop = (e: React.DragEvent) => {
-        e.preventDefault();
-        setIsDragOver(false);
-        processFiles(e.dataTransfer.files);
-    };
-
-    const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-        if (e.target.files) {
-            processFiles(e.target.files);
-        }
-        if (fileInputRef.current) {
-            fileInputRef.current.value = '';
-        }
-    };
-
-    const removeAttachment = async (index: number) => {
-        const attachment = attachments[index];
-        setAttachments(prev => prev.filter((_, i) => i !== index));
-
-        if (attachment.slug && !attachment.error) {
-            if (attachment.isNew) {
-                // If it's a new file (not yet saved to the paste), delete it immediately from backend
-                try {
-                    await api.file.delete(attachment.slug);
-                    toast.success(`Removed ${attachment.file_name}`);
-                } catch (err) {
-                    console.error("Failed to delete remote file", err);
-                }
-            } else {
-                // If it's an existing file, just queue it for removal when they save
-                setRemovedSlugs(prev => [...prev, attachment.slug as string]);
-                toast.success(`Queued ${attachment.file_name} for removal`);
-            }
-        }
-    };
-
-    if (loading) {
+    if (authLoading || loading) {
         return (
-            <div className="mx-auto max-w-3xl px-4 sm:px-6 py-8 space-y-6">
-                <Skeleton className="h-8 w-48" />
-                <div className="rounded-lg border p-6 space-y-5">
-                    <Skeleton className="h-10 w-full" />
-                    <Skeleton className="h-[320px] w-full" />
-                    <Skeleton className="h-10 w-32" />
-                </div>
+            <div className="flex-1 flex items-center justify-center text-muted-foreground">
+                <LoaderPinwheelIcon size={20} className="animate-spin mr-2" />
+                Decrypting paste…
             </div>
         );
     }
-
-    if (error || !paste) {
-        return (
-            <div className="mx-auto max-w-3xl px-4 sm:px-6 py-20">
-                <div className="flex flex-col items-center text-center">
-                    <BadgeAlertIcon size={48} className="text-destructive mb-4" />
-                    <h2 className="text-lg font-semibold">{error || 'Paste not found'}</h2>
-                    <Button variant="outline" className="mt-4" onClick={() => navigate('/')}>
-                        Go Home
-                    </Button>
-                </div>
-            </div>
-        );
-    }
+    if (notFound) return <ErrorState type="not-found" />;
+    if (!paste || !pasteKey) return <ErrorState type="not-found" />;
 
     return (
-        <div className="mx-auto max-w-3xl px-4 sm:px-6 py-12 min-h-[calc(100dvh-5rem)] flex flex-col justify-center">
-            <div className="flex items-center justify-between mb-6">
-                <div className="flex items-center gap-3">
-                    <Button variant="ghost" size="icon" onClick={() => navigate('/')} className="h-8 w-8 text-muted-foreground hover:text-primary hover:bg-primary/10">
-                        <ArrowLeftIcon size={16} />
+        <div className="mx-auto max-w-6xl w-full px-4 sm:px-6 py-5">
+            <form onSubmit={save} className="flex flex-col gap-4">
+                <div className="flex items-center gap-2">
+                    <Button type="button" variant="ghost" size="icon" onClick={() => navigate(`/p/${paste.id}`)}>
+                        <ArrowLeftIcon size={18} />
                     </Button>
-                    <h1 className="text-2xl font-bold tracking-tight">Edit Paste</h1>
+                    <div>
+                        <h1 className="text-xl font-semibold tracking-tight">Edit Paste</h1>
+                        <p className="text-xs text-muted-foreground font-mono">{paste.id}</p>
+                    </div>
                 </div>
-                <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => setDeleteOpen(true)}
-                    className="text-destructive hover:text-destructive hover:bg-destructive/10"
-                >
-                    <DeleteIcon size={16} className="mr-1.5" />
-                    Delete
-                </Button>
-            </div>
 
-            <form onSubmit={handleSave}>
-                <Card className="overflow-hidden">
-                    <CardContent className="p-0">
-                        {/* Settings Bar */}
-                        <div className="p-4 sm:p-6 border-b border-border/40 bg-muted/10">
-                            <div className="grid gap-5 sm:grid-cols-[1fr_200px]">
-                                <div className="space-y-1.5">
-                                    <Label htmlFor="title" className="text-xs uppercase tracking-wider text-muted-foreground font-semibold">Title</Label>
-                                    <Input
-                                        id="title"
-                                        placeholder="Untitled paste"
-                                        value={title}
-                                        onChange={(e) => setTitle(e.target.value)}
-                                        className="bg-background shadow-sm"
-                                    />
+                {hasShare && (
+                    <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-4 py-3 flex flex-wrap items-center gap-3 text-sm">
+                        <LockIcon size={16} className="text-amber-600 dark:text-amber-400" />
+                        <span className="flex-1 text-amber-700 dark:text-amber-300">
+                            Burn rules are locked while a share exists.
+                        </span>
+                        <Button type="button" size="sm" variant="outline" onClick={revokeShare}>
+                            Revoke share
+                        </Button>
+                    </div>
+                )}
+
+                <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_320px]">
+                    <Card>
+                        <CardContent className="p-5 flex flex-col gap-4">
+                            <div className="flex flex-col gap-1.5">
+                                <Label htmlFor="edit-title">Title</Label>
+                                <Input
+                                    id="edit-title"
+                                    value={title}
+                                    onChange={(event) => setTitle(event.target.value)}
+                                    placeholder="Optional title"
+                                    maxLength={512}
+                                />
+                            </div>
+                            <div className="flex flex-col gap-1.5">
+                                <div className="flex items-center justify-between">
+                                    <Label htmlFor="edit-content">Content</Label>
+                                    <span className="text-[11px] text-muted-foreground">
+                                        {formatFileSize(new TextEncoder().encode(content).byteLength)} / {formatFileSize(config.maxTextSize)}
+                                    </span>
                                 </div>
-                                <div className="space-y-1.5">
-                                    <Label className="text-xs uppercase tracking-wider text-muted-foreground font-semibold">Language</Label>
+                                <Textarea
+                                    id="edit-content"
+                                    value={content}
+                                    onChange={(event) => setContent(event.target.value)}
+                                    className="min-h-[320px] font-mono text-sm"
+                                    spellCheck={false}
+                                />
+                            </div>
+
+                            <div className="flex flex-col gap-2">
+                                <div className="flex items-center justify-between">
+                                    <Label>Attachments</Label>
+                                    <span className="text-[11px] text-muted-foreground">
+                                        {formatFileSize(existingSize + stagedEstimate)} / {formatFileSize(config.maxFileSize)}
+                                    </span>
+                                </div>
+
+                                {existingFiles.length > 0 && (
+                                    <div className="flex flex-col gap-1.5">
+                                        {existingFiles.map((file) => (
+                                            <div
+                                                key={file.meta.id}
+                                                className="flex items-center gap-2 rounded-md border border-border/50 px-3 py-2"
+                                            >
+                                                <FileTextIcon size={16} className="text-primary/70 shrink-0" />
+                                                <span className="text-sm truncate flex-1">
+                                                    {truncateFileName(file.plain.name, 42)}
+                                                </span>
+                                                <span className="text-[11px] text-muted-foreground shrink-0">
+                                                    {formatFileSize(file.plain.size)}
+                                                </span>
+                                                <Button
+                                                    type="button"
+                                                    variant="ghost"
+                                                    size="icon"
+                                                    className="h-7 w-7"
+                                                    onClick={() => downloadExisting(file)}
+                                                    aria-label="Download attachment"
+                                                >
+                                                    <DownloadIcon size={14} />
+                                                </Button>
+                                            </div>
+                                        ))}
+                                        <p className="text-[11px] text-muted-foreground">
+                                            Existing attachments cannot be removed individually. Delete the paste to remove them.
+                                        </p>
+                                    </div>
+                                )}
+
+                                <div
+                                    className={cn(
+                                        'rounded-md border border-dashed p-4 transition-colors',
+                                        isDragOver
+                                            ? 'border-primary bg-primary/5'
+                                            : 'border-border/60 bg-muted/10',
+                                    )}
+                                    onDragOver={(event) => {
+                                        event.preventDefault();
+                                        setIsDragOver(true);
+                                    }}
+                                    onDragLeave={() => setIsDragOver(false)}
+                                    onDrop={handleDrop}
+                                >
+                                    <div className="flex flex-col items-center gap-2 text-center">
+                                        <UploadIcon size={20} className="text-primary/70" />
+                                        <p className="text-sm">Add more encrypted files</p>
+                                        <label className="cursor-pointer">
+                                            <input
+                                                type="file"
+                                                multiple
+                                                className="hidden"
+                                                onChange={handleFileInput}
+                                            />
+                                            <span className="inline-flex h-9 items-center rounded-md border border-input bg-background px-3 text-sm font-medium hover:bg-accent">
+                                                Choose Files
+                                            </span>
+                                        </label>
+                                    </div>
+                                </div>
+
+                                {stagedFiles.length > 0 && (
+                                    <div className="flex flex-col gap-1.5">
+                                        {stagedFiles.map((file) => (
+                                            <div
+                                                key={file.key}
+                                                className="flex items-center gap-2 rounded-md border border-border/50 px-3 py-2"
+                                            >
+                                                <FileTextIcon size={16} className="text-primary/70 shrink-0" />
+                                                <span className="text-sm truncate flex-1">
+                                                    {truncateFileName(file.file.name, 42)}
+                                                </span>
+                                                <span className="text-[11px] text-muted-foreground shrink-0">
+                                                    {formatFileSize(file.file.size)}
+                                                </span>
+                                                <Button
+                                                    type="button"
+                                                    variant="ghost"
+                                                    size="icon"
+                                                    className="h-7 w-7 text-muted-foreground hover:text-destructive"
+                                                    onClick={() => removeStaged(file.key)}
+                                                    aria-label="Remove staged attachment"
+                                                >
+                                                    <DeleteIcon size={14} />
+                                                </Button>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+                            </div>
+                        </CardContent>
+                    </Card>
+
+                    <div className="flex flex-col gap-4">
+                        <Card>
+                            <CardContent className="p-5 flex flex-col gap-4">
+                                <div className="flex flex-col gap-1.5">
+                                    <Label htmlFor="edit-language">Language</Label>
                                     <Select value={language} onValueChange={setLanguage}>
-                                        <SelectTrigger className="bg-background shadow-sm">
+                                        <SelectTrigger id="edit-language">
                                             <SelectValue />
                                         </SelectTrigger>
                                         <SelectContent>
-                                            {LANGUAGES.map((lang) => (
-                                                <SelectItem key={lang.value} value={lang.value}>
-                                                    {lang.label}
+                                            {LANGUAGES.map((option) => (
+                                                <SelectItem key={option.value} value={option.value}>
+                                                    {option.label}
                                                 </SelectItem>
                                             ))}
                                         </SelectContent>
                                     </Select>
                                 </div>
-                            </div>
-                        </div>
 
-                        {/* Editor Area */}
-                        <div className="p-4 sm:p-6 space-y-4">
-                            <div className="space-y-2">
-                                <div className="flex items-center justify-between mb-1">
-                                    <Label htmlFor="content" className="text-xs uppercase tracking-wider text-muted-foreground font-semibold">Content</Label>
-                                    <Button
-                                        type="button"
-                                        variant="secondary"
-                                        size="sm"
-                                        className="h-7 text-xs flex items-center gap-1.5 px-3 rounded-md"
-                                        onClick={() => setUploadDialogOpen(true)}
-                                    >
-                                        <UploadIcon size={12} />
-                                        Attach Files
-                                    </Button>
-                                </div>
-                                <Textarea
-                                    id="content"
-                                    placeholder="Paste your code or text here..."
-                                    value={content}
-                                    onChange={(e) => setContent(e.target.value)}
-                                    onKeyDown={handleKeyDown}
-                                    className="paste-editor min-h-[300px] font-mono text-sm resize-y shadow-sm"
-                                />
-                            </div>
-
-                        {attachments.length > 0 && (
-                            <div className="px-4 sm:px-6 pb-6 space-y-3">
-                                <Label className="text-xs uppercase tracking-wider text-muted-foreground font-semibold">
-                                    Attachments ({attachments.length})
-                                </Label>
-                                <div className="grid gap-2 grid-cols-1 sm:grid-cols-2">
-                                    {attachments.map((attachment, idx) => (
-                                        <div key={idx} className={cn(
-                                            "group relative border border-border/60 rounded-lg p-2 flex items-center gap-3 overflow-hidden",
-                                            attachment.error ? "bg-destructive/5 border-destructive/20" : "bg-muted/10 hover:bg-muted/30 transition-colors"
-                                        )}>
-                                            <div className="rounded-lg bg-primary/10 p-2 shrink-0">
-                                                {attachment.uploading ? (
-                                                    <LoaderPinwheelIcon size={20} className="text-primary animate-spin" />
-                                                ) : (
-                                                    <FileTextIcon size={20} className={attachment.error ? "text-destructive" : "text-primary"} />
-                                                )}
-                                            </div>
-                                            <div className="flex-1 min-w-0 pr-8">
-                                                <p className="text-sm font-medium truncate" title={attachment.file_name}>
-                                                    {truncateFileName(attachment.file_name)}
-                                                </p>
-                                                <p className="text-xs text-muted-foreground mt-0.5">
-                                                    {attachment.error ? (
-                                                        <span className="text-destructive">{attachment.error}</span>
-                                                    ) : (
-                                                        formatFileSize(attachment.file_size)
-                                                    )}
-                                                </p>
-                                            </div>
-                                            
-                                            <div className="absolute right-2 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity">
-                                                <Button
-                                                    type="button"
-                                                    variant="destructive"
-                                                    size="icon"
-                                                    className="h-8 w-8 shadow-sm"
-                                                    onClick={() => removeAttachment(idx)}
-                                                >
-                                                    <DeleteIcon size={14} />
-                                                </Button>
-                                            </div>
-                                        </div>
-                                    ))}
-                                </div>
-                            </div>
-                        )}
-                        </div>
-
-                        <div className="flex flex-col md:flex-row items-stretch md:items-center justify-between gap-4 py-4 px-4 sm:px-6 bg-muted/10 border-t border-border/40 rounded-b-xl">
-                            {/* Left group */}
-                            <div className="flex flex-row flex-wrap items-center justify-center md:justify-start gap-3 sm:gap-4 md:gap-6 w-full md:w-auto order-1 md:order-none">
-                                <div className="flex items-center gap-2">
-                                    <Label
-                                        htmlFor="pin-toggle"
-                                        className={cn(
-                                            "text-sm font-medium cursor-pointer select-none flex items-center gap-1.5 transition-colors whitespace-nowrap",
-                                            isPinned ? "text-primary" : "text-muted-foreground"
-                                        )}
-                                    >
-                                        <PinIcon size={14} className={cn("transition-transform", isPinned && "rotate-45")} />
-                                        <span className="inline">Pinned</span>
-                                    </Label>
+                                <div className="flex items-center justify-between">
+                                    <div className="flex items-center gap-2">
+                                        <PinIcon size={16} className="text-primary" />
+                                        <Label htmlFor="edit-pinned">Pin to top</Label>
+                                    </div>
                                     <Switch
+                                        id="edit-pinned"
                                         checked={isPinned}
                                         onCheckedChange={setIsPinned}
-                                        id="pin-toggle"
                                     />
                                 </div>
-                                <div className="h-3 w-px bg-border/60 hidden sm:block" />
-                                <BurnRulesControl
-                                    burnTrigger={burnTrigger}
-                                    setBurnTrigger={(v) => { setBurnTrigger(v); setBurnTimeWarning(null); }}
-                                    burnValue={burnValue}
-                                    setBurnValue={setBurnValue}
-                                    burnUnit={burnUnit}
-                                    setBurnUnit={setBurnUnit}
-                                    burnUnlocks={burnUnlocks}
-                                    setBurnUnlocks={setBurnUnlocks}
-                                    burnAction={burnAction}
-                                    setBurnAction={setBurnAction}
-                                    isShared={!!paste?.share_wrapped_paste_key}
-                                />
-                                {burnTimeWarning && (
-                                    <p className="text-xs text-amber-500 max-w-xs mt-2 md:mt-0">
-                                        ⚠️ {burnTimeWarning}
-                                    </p>
-                                )}
-                            </div>
 
-                            {/* Right group */}
-                            <div className="flex items-center justify-center md:justify-end gap-3 w-full md:w-auto order-2 md:order-none">
-                                <Button
-                                    type="submit"
-                                    disabled={saving || attachments.some(a => a.uploading)}
-                                    className="w-full md:w-auto h-10 px-8 text-sm font-medium shadow-sm"
-                                >
-                                    {saving ? (
-                                        <LoaderPinwheelIcon size={14} className="animate-spin" />
-                                    ) : (
-                                        "Save Changes"
-                                    )}
+                                <div className="h-px bg-border/60" />
+
+                                <BurnRulesControl
+                                    trigger={burnTrigger}
+                                    onTriggerChange={(value) => {
+                                        setBurnTrigger(value);
+                                        setBurnDirty(true);
+                                    }}
+                                    timeValue={burnValue}
+                                    onTimeValueChange={(value) => {
+                                        setBurnValue(value);
+                                        setBurnDirty(true);
+                                    }}
+                                    unit={burnUnit}
+                                    onUnitChange={(value) => {
+                                        setBurnUnit(value);
+                                        setBurnDirty(true);
+                                    }}
+                                    unlockValue={unlockValue}
+                                    onUnlockValueChange={(value) => {
+                                        setUnlockValue(value);
+                                        setBurnDirty(true);
+                                    }}
+                                    disabled={hasShare || saving}
+                                    disabledReason={hasShare ? 'Burn rules locked by share' : saving ? 'Saving…' : undefined}
+                                />
+                            </CardContent>
+                        </Card>
+
+                        <Card>
+                            <CardContent className="p-5 flex flex-col gap-3">
+                                <Button type="submit" disabled={saving} className="w-full">
+                                    {saving && <LoaderPinwheelIcon size={16} className="mr-2 animate-spin" />}
+                                    {busyLabel || 'Save Changes'}
                                 </Button>
-                            </div>
-                        </div>
-                    </CardContent>
-                </Card>
+                                <Button
+                                    type="button"
+                                    variant="outline"
+                                    className="w-full text-destructive hover:text-destructive"
+                                    onClick={() => setDeleteOpen(true)}
+                                    disabled={saving}
+                                >
+                                    <DeleteIcon size={16} className="mr-2" />
+                                    Delete Paste
+                                </Button>
+                            </CardContent>
+                        </Card>
+                    </div>
+                </div>
             </form>
 
             <Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>
@@ -589,123 +638,18 @@ export function EditPaste() {
                     <DialogHeader>
                         <DialogTitle>Delete Paste</DialogTitle>
                         <DialogDescription>
-                            Are you sure you want to delete this paste? This action cannot be undone.
-                            {attachments.length > 0 && " This will also delete all attached files."}
+                            This permanently deletes the paste, its share, and all attachments.
                         </DialogDescription>
                     </DialogHeader>
-                    <DialogFooter className="gap-2 sm:gap-0 mt-4">
+                    <DialogFooter className="gap-2 sm:gap-0">
                         <DialogClose asChild>
-                            <Button variant="outline">Cancel</Button>
+                            <Button variant="outline" disabled={deleting}>Cancel</Button>
                         </DialogClose>
-                        <Button
-                            variant="destructive"
-                            onClick={() => {
-                                setDeleteOpen(false);
-                                handleDelete();
-                            }}
-                        >
-                            <DeleteIcon size={16} className="mr-1.5" />
+                        <Button variant="destructive" onClick={deletePaste} disabled={deleting}>
+                            {deleting && <LoaderPinwheelIcon size={16} className="mr-1.5 animate-spin" />}
                             Delete
                         </Button>
                     </DialogFooter>
-                </DialogContent>
-            </Dialog>
-
-            {/* Upload Files Dialog */}
-            <Dialog open={uploadDialogOpen} onOpenChange={setUploadDialogOpen}>
-                <DialogContent className="sm:max-w-md">
-                    <DialogHeader>
-                        <DialogTitle>Upload Files</DialogTitle>
-                    </DialogHeader>
-                    
-                    <div className="flex flex-col gap-4 mt-2">
-                        <div
-                            className={cn(
-                                "border-2 border-dashed rounded-lg transition-all duration-200 cursor-pointer flex flex-col items-center justify-center p-8 gap-4 min-h-[200px]",
-                                isDragOver
-                                    ? "border-primary bg-primary/5 scale-[1.02]"
-                                    : "border-border/60 hover:border-primary/40 hover:bg-muted/30"
-                            )}
-                            onDragOver={(e) => { e.preventDefault(); setIsDragOver(true); }}
-                            onDragLeave={() => setIsDragOver(false)}
-                            onDrop={handleFileDrop}
-                            onClick={() => fileInputRef.current?.click()}
-                        >
-                            <div className={cn(
-                                "rounded-full p-4 transition-colors",
-                                isDragOver ? "bg-primary/10" : "bg-muted/50"
-                            )}>
-                                <UploadIcon size={32} className={cn(
-                                    "transition-colors",
-                                    isDragOver ? "text-primary" : "text-muted-foreground"
-                                )} />
-                            </div>
-                            <div className="text-center">
-                                <p className={cn(
-                                    "text-sm font-medium transition-colors",
-                                    isDragOver ? "text-primary" : "text-foreground"
-                                )}>
-                                    {isDragOver ? "Drop files here" : "Drag & drop files here"}
-                                </p>
-                                <p className="text-xs text-muted-foreground mt-1">
-                                    or click to browse • Max 50 MB
-                                </p>
-                            </div>
-                        </div>
-
-                        <input
-                            ref={fileInputRef}
-                            type="file"
-                            className="hidden"
-                            multiple
-                            onChange={handleFileSelect}
-                        />
-                        
-                        {attachments.length > 0 && (
-                            <div className="mt-2 space-y-2 max-h-[160px] overflow-y-auto pr-1">
-                                {attachments.map((attachment, idx) => (
-                                    <div key={idx} className="flex items-center justify-between p-2 rounded-md bg-muted/30 border border-border/40 text-sm">
-                                        <div className="flex items-center gap-2 min-w-0 pr-2">
-                                            {attachment.uploading ? (
-                                                <LoaderPinwheelIcon size={14} className="text-primary animate-spin shrink-0" />
-                                            ) : attachment.error ? (
-                                                <FileTextIcon size={14} className="text-destructive shrink-0" />
-                                            ) : (
-                                                <FileTextIcon size={14} className="text-primary shrink-0" />
-                                            )}
-                                            <span className="truncate text-foreground/90 font-medium" title={attachment.file_name}>
-                                                {truncateFileName(attachment.file_name)}
-                                            </span>
-                                        </div>
-                                        <div className="flex items-center gap-2 shrink-0">
-                                            <span className="text-xs text-muted-foreground hidden sm:inline-block">
-                                                {attachment.error ? (
-                                                    <span className="text-destructive">{attachment.error}</span>
-                                                ) : (
-                                                    formatFileSize(attachment.file_size)
-                                                )}
-                                            </span>
-                                            <Button
-                                                variant="ghost"
-                                                size="icon"
-                                                className="h-6 w-6 text-muted-foreground hover:text-destructive hover:bg-destructive/10"
-                                                onClick={() => removeAttachment(idx)}
-                                                title="Remove file"
-                                            >
-                                                <DeleteIcon size={12} />
-                                            </Button>
-                                        </div>
-                                    </div>
-                                ))}
-                            </div>
-                        )}
-
-                        <div className="flex justify-end pt-2">
-                            <Button variant="default" onClick={() => setUploadDialogOpen(false)}>
-                                Done
-                            </Button>
-                        </div>
-                    </div>
                 </DialogContent>
             </Dialog>
         </div>

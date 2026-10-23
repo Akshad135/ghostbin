@@ -21,7 +21,10 @@ export const config = {
     pwaIconSvg: import.meta.env.VITE_PWA_ICON_SVG || '/icon.svg',
     pwaIconMaskableSvg: import.meta.env.VITE_PWA_ICON_MASKABLE_SVG || '/icon-maskable.svg',
     appleTouchIcon: import.meta.env.VITE_APPLE_TOUCH_ICON || '/icon-192.png',
-    // Maximum text paste size in bytes. Must match MAX_TEXT_SIZE on the server.
-    // Default: 524288 (512 KB).
+    // Maximum plaintext paste size in bytes. Must not exceed the server's
+    // MAX_TEXT_SIZE. Default: 524288 (512 KB).
     maxTextSize: Number(import.meta.env.VITE_MAX_TEXT_SIZE) || 524_288,
+    // Maximum encrypted attachment quota per paste in bytes. Must match the
+    // server's MAX_FILE_SIZE. Default: 52428800 (50 MB).
+    maxFileSize: Number(import.meta.env.VITE_MAX_FILE_SIZE) || 52_428_800,
 } as const;

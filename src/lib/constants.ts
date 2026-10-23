@@ -51,7 +51,6 @@ export const LANGUAGES = [
     { value: 'proto', label: 'Protobuf' },
 ];
 
-
 export const LANG_MAP: Record<string, string> = {
     plaintext: 'text',
     shellscript: 'shellscript',
@@ -75,7 +74,7 @@ export function getLanguageLabel(value: string): string {
 
 // ─── Burn Rules ─────────────────────────────────────────────────────────────
 
-export type BurnAction = 'revoke_share' | 'delete';
+export type BurnMode = 'time' | 'unlock_count';
 export type BurnUnit = 'minute' | 'hour' | 'day';
 
 export const BURN_TRIGGER_OPTIONS = [
@@ -88,11 +87,6 @@ export const BURN_UNIT_OPTIONS = [
     { value: 'minute', label: 'Minutes' },
     { value: 'hour', label: 'Hours' },
     { value: 'day', label: 'Days' },
-];
-
-export const BURN_ACTION_OPTIONS = [
-    { value: 'delete', label: 'Delete paste' },
-    { value: 'revoke_share', label: 'Revoke share access' },
 ];
 
 /**
@@ -120,7 +114,7 @@ export function validateBurnRule(
         if (!unlocks || isNaN(num) || num <= 0 || !Number.isInteger(num)) {
             return 'Please enter a valid unlock count (whole number).';
         }
-        if (num > 100_000) return 'Unlock count cannot exceed 100,000.';
+        if (num > 1_000_000) return 'Unlock count cannot exceed 1,000,000.';
     }
     return null;
 }
@@ -131,34 +125,29 @@ export function validateBurnRule(
  */
 export function burnStatusLabel(
     paste: {
-        burn_trigger: string | null;
-        burn_action: string;
-        burn_at: string | null;
-        burn_after_unlocks: number | null;
-        burn_unlocks_used: number;
+        burnMode: string | null;
+        burnAfter: number | null;
+        burnAt: number | null;
     },
     compact = false,
 ): string {
-    if (!paste.burn_trigger) return '';
-    const action = paste.burn_action === 'revoke_share' ? 'Revoke' : 'Delete';
-    if (paste.burn_trigger === 'time' && paste.burn_at) {
-        const remaining = new Date(paste.burn_at + 'Z').getTime() - Date.now();
-        if (remaining <= 0) return `${action} (burned)`;
-        const label = timeUntil(paste.burn_at);
-        return compact ? `${action} in ${label}` : `${action} after ${label}`;
+    if (!paste.burnMode) return '';
+    if (paste.burnMode === 'time' && paste.burnAt != null) {
+        const remaining = paste.burnAt * 1000 - Date.now();
+        if (remaining <= 0) return 'Delete (burned)';
+        const label = timeUntil(paste.burnAt);
+        return compact ? `Delete in ${label}` : `Delete after ${label}`;
     }
-    if (paste.burn_trigger === 'unlock_count' && paste.burn_after_unlocks != null) {
-        const left = paste.burn_after_unlocks - paste.burn_unlocks_used;
-        const safe = Math.max(0, left);
-        return `${action} after ${safe} more unlock${safe === 1 ? '' : 's'}`;
+    if (paste.burnMode === 'unlock_count' && paste.burnAfter != null) {
+        const count = paste.burnAfter;
+        return `Delete after ${count} unlock${count === 1 ? '' : 's'}`;
     }
     return '';
 }
 
-export function timeAgo(dateString: string): string {
-    const date = new Date(dateString + 'Z'); // D1 stores UTC
-    const now = new Date();
-    const seconds = Math.floor((now.getTime() - date.getTime()) / 1000);
+export function timeAgo(epochSeconds: number): string {
+    if (!Number.isFinite(epochSeconds)) return '';
+    const seconds = Math.max(0, Math.floor(Date.now() / 1000 - epochSeconds));
 
     if (seconds < 60) return 'just now';
     if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
@@ -170,12 +159,10 @@ export function timeAgo(dateString: string): string {
 
 // ─── Time helpers ────────────────────────────────────────────────────────────
 
-/** Returns the time remaining until a UTC timestamp string, e.g. "3h left". */
-export function timeUntil(utcDateString: string | null): string {
-    if (!utcDateString) return '';
-    const target = new Date(utcDateString + 'Z');
-    const now = new Date();
-    const seconds = Math.floor((target.getTime() - now.getTime()) / 1000);
+/** Returns the time remaining until a Unix-seconds timestamp, e.g. "3h left". */
+export function timeUntil(epochSeconds: number | null): string {
+    if (epochSeconds == null || !Number.isFinite(epochSeconds)) return '';
+    const seconds = Math.floor(epochSeconds - Date.now() / 1000);
 
     if (seconds <= 0) return 'soon';
     if (seconds < 60) return `${seconds}s left`;
@@ -183,4 +170,9 @@ export function timeUntil(utcDateString: string | null): string {
     if (seconds < 86400) return `${Math.floor(seconds / 3600)}h left`;
     if (seconds < 604800) return `${Math.floor(seconds / 86400)}d left`;
     return `${Math.floor(seconds / 604800)}w left`;
+}
+
+export function formatTimestamp(epochSeconds: number): string {
+    if (!Number.isFinite(epochSeconds)) return '';
+    return new Date(epochSeconds * 1000).toLocaleString();
 }

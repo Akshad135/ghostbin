@@ -1,21 +1,19 @@
-import { BrowserRouter, Routes, Route } from 'react-router-dom';
+import { BrowserRouter, Navigate, Route, Routes, useParams } from 'react-router-dom';
 import { Toaster } from 'sonner';
 import { ThemeProvider } from '@/components/ThemeProvider';
 import { AuthProvider } from '@/lib/auth';
-import { OfflineProvider, useOffline } from '@/lib/offlineContext';
 import { Navbar } from '@/components/Navbar';
 import { Home } from '@/pages/Home';
 import { NewPaste } from '@/pages/NewPaste';
 import { EditPaste } from '@/pages/EditPaste';
 import { ViewPaste } from '@/pages/ViewPaste';
 import { ErrorState } from '@/components/ErrorState';
-import { WifiOff } from 'lucide-react';
 
 function ThemedToaster() {
   return (
     <Toaster
       position="bottom-center"
-      duration={2000}
+      duration={2200}
       toastOptions={{
         style: {
           background: 'hsl(var(--card))',
@@ -31,48 +29,33 @@ function ThemedToaster() {
   );
 }
 
-function OfflineBanner() {
-  const { isOffline } = useOffline();
-
-  if (!isOffline) return null;
-
-  return (
-    <div className="shrink-0 flex items-center justify-center gap-2 px-4 py-1.5 text-xs font-medium border-b border-border/60"
-      style={{
-        background: 'hsl(var(--muted))',
-        color: 'hsl(var(--muted-foreground))',
-      }}
-    >
-      <WifiOff size={14} />
-      <span>You're offline. Some actions are unavailable.</span>
-    </div>
-  );
+function LegacyPasteRedirect() {
+  const { id } = useParams<{ id: string }>();
+  return <Navigate to={`/p/${encodeURIComponent(id ?? '')}`} replace />;
 }
 
 function App() {
   return (
     <BrowserRouter>
       <ThemeProvider>
-        <OfflineProvider>
-          <AuthProvider>
-            <div className="h-[100dvh] flex flex-col overflow-hidden">
-              <Navbar />
-              <OfflineBanner />
-              <main className="flex-1 overflow-auto min-h-0">
-                <Routes>
-                  <Route path="/" element={<Home />} />
-                  <Route path="/new" element={<NewPaste />} />
-                  <Route path="/paste/:slug" element={<ViewPaste />} />
-                  <Route path="/edit/:slug" element={<EditPaste />} />
-                  <Route path="*" element={<ErrorState />} />
-                </Routes>
-              </main>
-            </div>
-            <ThemedToaster />
-          </AuthProvider>
-        </OfflineProvider>
+        <AuthProvider>
+          <div className="h-[100dvh] flex flex-col overflow-hidden">
+            <Navbar />
+            <main className="flex-1 overflow-auto min-h-0">
+              <Routes>
+                <Route path="/" element={<Home />} />
+                <Route path="/new" element={<NewPaste />} />
+                <Route path="/p/:id" element={<ViewPaste />} />
+                <Route path="/paste/:id" element={<LegacyPasteRedirect />} />
+                <Route path="/edit/:id" element={<EditPaste />} />
+                <Route path="*" element={<ErrorState />} />
+              </Routes>
+            </main>
+          </div>
+          <ThemedToaster />
+        </AuthProvider>
       </ThemeProvider>
-    </BrowserRouter >
+    </BrowserRouter>
   );
 }
 

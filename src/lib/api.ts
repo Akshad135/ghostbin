@@ -1,376 +1,589 @@
-// API client for ghostbin backend
+// API client for the Phase 3 encrypted backend.
+//
+// All owner requests use the HttpOnly session cookie. Mutating requests also
+// send the CSRF token issued at login/setup and stored in the readable
+// __Host-gb_csrf cookie. Guest share requests use a short-lived share token.
 
 const API_BASE = "/api";
 
-export interface Paste {
-  id: number;
-  slug: string;
-  title: string;
-  content: string;
-  language: string;
-  pinned: number;
-  burn_trigger: 'time' | 'unlock_count' | null;
-  burn_action: 'revoke_share' | 'delete';
-  burn_at: string | null;
-  burn_after_unlocks: number | null;
-  burn_unlocks_used: number;
-  burn_pending_delete_at: string | null;
-  created_at: string;
-  updated_at: string;
+export type BurnMode = "time" | "unlock_count";
 
-  file_count?: number;
-  encrypted_paste_key?: string | null;
-  share_wrapped_paste_key?: string | null;
-  share_auth_salt?: string | null;
-  share_auth_verifier?: string | null;
+export interface KdfParams {
+  memorySize: number;
+  iterations: number;
+  parallelism: number;
+  hashLength: number;
 }
 
-export interface FileEntry {
-  id: number;
-  slug: string;
-  paste_slug: string | null;
-  file_name: string;
-  mime_type: string;
-  file_size: number;
-  created_at: string;
+export interface AuthParams {
+  configured: boolean;
+  kdfSalt?: string;
+  kdfParams?: KdfParams;
+}
+
+export interface VaultResponse {
+  kdfSalt: string;
+  kdfParams: KdfParams;
+  wrappedVaultKey: string;
+}
+
+export interface AuthSessionResponse {
+  success: boolean;
+  csrfToken: string;
+}
+
+export interface FileMeta {
+  id: string;
+  encMeta: string;
+  /** Encrypted body length in bytes, as stored by the server. */
+  size: number;
+  createdAt: number;
+}
+
+export interface PasteSummary {
+  id: string;
+  keySalt: string;
+  titleCt: string;
+  languageCt: string | null;
+  pinned: boolean;
+  burnMode: BurnMode | null;
+  burnAfter: number | null;
+  burnAt: number | null;
+  createdAt: number;
+  updatedAt: number;
+  fileCount: number;
+}
+
+export interface PasteDetail extends PasteSummary {
+  contentCt: string;
+  files: FileMeta[];
 }
 
 export interface PasteListResponse {
-  pastes: Paste[];
+  pastes: PasteSummary[];
   total: number;
   page: number;
   limit: number;
   hasMore: boolean;
 }
 
-// ─── Core fetch helper (unchanged for write operations) ───
+export interface CreatePasteInput {
+  id: string;
+  keySalt: string;
+  titleCt: string;
+  contentCt: string;
+  languageCt?: string | null;
+  pinned?: boolean;
+  burnMode?: BurnMode | "none" | null;
+  burnAfter?: number | null;
+  burnAfterSeconds?: number | null;
+}
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), 10000); // 10s hard timeout
+export interface UpdatePasteInput {
+  titleCt?: string;
+  contentCt?: string;
+  languageCt?: string | null;
+  pinned?: boolean;
+  burnMode?: BurnMode | "none";
+  burnAfter?: number | null;
+  burnAfterSeconds?: number | null;
+}
 
-  try {
-    const res = await fetch(`${API_BASE}${path}`, {
-      ...options,
-      signal: controller.signal,
-      credentials: "include",
-      headers: {
-        "Content-Type": "application/json",
-        ...options?.headers,
-      },
-    });
-    clearTimeout(id);
+export interface ShareInfo {
+  createdAt: number;
+  expiresAt: number | null;
+  unlocksUsed?: number;
+  maxUnlocks: number | null;
+}
 
-    let data: unknown;
-    try {
-      data = await res.json();
-    } catch {
-      throw new Error(`Server error (${res.status})`);
-    }
+export type ShareStatusResponse =
+  | { exists: false }
+  | { exists: true; share: ShareInfo };
 
-    if (!res.ok) {
-      throw new Error((data as { error?: string }).error || "Request failed");
-    }
+export interface CreateShareInput {
+  shareSalt: string;
+  shareAuthKey: string;
+  wrappedPasteKey: string;
+  expiresAt?: number | null;
+  maxUnlocks?: number | null;
+  replace?: boolean;
+}
 
-    return data as T;
-  } catch (err) {
-    clearTimeout(id);
-    if (err instanceof Error) throw err;
-    throw new Error(String(err));
+export interface ShareParams {
+  shareSalt: string;
+  kdfParams: KdfParams;
+  expiresAt: number | null;
+  unlocksUsed: number;
+  maxUnlocks: number | null;
+}
+
+export interface ChallengeResponse {
+  nonce: string;
+  expiresAt: number;
+}
+
+export interface UnlockResponse {
+  shareToken: string;
+  shareTokenExpiresAt: number;
+  unlocksUsed: number;
+  maxUnlocks: number | null;
+  files: FileMeta[];
+}
+
+export interface GuestPaste {
+  id: string;
+  titleCt: string;
+  contentCt: string;
+  languageCt: string | null;
+  pinned: boolean;
+  burnMode: BurnMode | null;
+  burnAfter: number | null;
+  burnAt: number | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface GuestShare {
+  shareSalt: string;
+  wrappedPasteKey: string;
+}
+
+export interface ViewResponse {
+  success: boolean;
+  unlocksUsed: number;
+  burned: boolean;
+  paste: GuestPaste;
+  share: GuestShare;
+  files: FileMeta[];
+}
+
+export interface PasteEvent {
+  type: string;
+  pasteId: string;
+}
+
+export class ApiError extends Error {
+  readonly status: number;
+  readonly code: string;
+  readonly retryAfter?: number;
+
+  constructor(
+    message: string,
+    status: number,
+    code: string,
+    retryAfter?: number,
+  ) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = code;
+    this.retryAfter = retryAfter;
   }
+}
+
+let csrfToken: string | null = null;
+
+export function setCsrfToken(token: string | null): void {
+  csrfToken = token;
+}
+
+function readCsrfCookie(): string | null {
+  if (typeof document === "undefined") return null;
+  const name = "__Host-gb_csrf=";
+  for (const part of document.cookie.split(";")) {
+    const trimmed = part.trim();
+    if (trimmed.startsWith(name)) {
+      return decodeURIComponent(trimmed.slice(name.length));
+    }
+  }
+  return null;
+}
+
+function currentCsrfToken(): string | null {
+  // The cookie is shared by every tab. Prefer it so a login in another tab
+  // does not leave this tab holding a stale in-memory token.
+  return readCsrfCookie() ?? csrfToken;
+}
+
+function retryAfterSeconds(response: Response): number | undefined {
+  const header = response.headers.get("retry-after");
+  if (!header) return undefined;
+  const value = Number(header);
+  return Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+async function errorFromResponse(response: Response): Promise<ApiError> {
+  let message = `Request failed (${response.status})`;
+  let code = `HTTP_${response.status}`;
+
+  const contentType = response.headers.get("content-type") ?? "";
+  if (contentType.includes("application/json")) {
+    try {
+      const body = (await response.json()) as {
+        error?: unknown;
+        message?: unknown;
+        code?: unknown;
+      };
+      if (typeof body.error === "string" && body.error) message = body.error;
+      else if (typeof body.message === "string" && body.message) {
+        message = body.message;
+      }
+      if (typeof body.code === "string" && body.code) code = body.code;
+    } catch {
+      // Keep the status-based fallback.
+    }
+  }
+
+  return new ApiError(
+    message,
+    response.status,
+    code,
+    retryAfterSeconds(response),
+  );
+}
+
+async function request<T>(
+  path: string,
+  options: RequestInit = {},
+): Promise<T> {
+  const headers = new Headers(options.headers);
+  headers.set("Accept", "application/json");
+
+  const token = currentCsrfToken();
+  if (token) headers.set("X-CSRF-Token", token);
+
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 30_000);
+
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      ...options,
+      headers,
+      credentials: "include",
+      cache: "no-store",
+      signal: options.signal ?? controller.signal,
+    });
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new ApiError("The request timed out", 0, "TIMEOUT");
+    }
+    throw new ApiError("Cannot reach the server", 0, "NETWORK");
+  } finally {
+    window.clearTimeout(timeout);
+  }
+
+  if (!response.ok) {
+    const error = await errorFromResponse(response);
+    if (error.status === 403 && error.code === "CSRF_REJECTED") {
+      window.dispatchEvent(new Event("ghostbin-auth-invalid"));
+    }
+    throw error;
+  }
+  if (response.status === 204) return undefined as T;
+
+  const contentType = response.headers.get("content-type") ?? "";
+  if (!contentType.includes("application/json")) {
+    throw new ApiError(
+      "The server returned an unexpected response",
+      response.status,
+      "INVALID_RESPONSE",
+    );
+  }
+  return (await response.json()) as T;
+}
+
+function jsonRequest<T>(
+  path: string,
+  method: "POST" | "PUT" | "DELETE",
+  body?: unknown,
+): Promise<T> {
+  const headers: Record<string, string> = {};
+  let encoded: string | undefined;
+  if (body !== undefined) {
+    headers["Content-Type"] = "application/json";
+    encoded = JSON.stringify(body);
+  }
+  return request<T>(path, { method, body: encoded, headers });
+}
+
+async function downloadFile(
+  fileId: string,
+  shareToken?: string,
+): Promise<Uint8Array> {
+  const headers = new Headers();
+  if (shareToken) headers.set("X-Share-Token", shareToken);
+
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 60_000);
+
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}/files/${encodeURIComponent(fileId)}`, {
+      headers,
+      credentials: "include",
+      cache: "no-store",
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new ApiError("The file download timed out", 0, "TIMEOUT");
+    }
+    throw new ApiError("Cannot reach the server", 0, "NETWORK");
+  } finally {
+    window.clearTimeout(timeout);
+  }
+
+  if (!response.ok) throw await errorFromResponse(response);
+  return new Uint8Array(await response.arrayBuffer());
+}
+
+interface UploadFileInput {
+  pasteId: string;
+  fileId: string;
+  encrypted: Uint8Array;
+  encMeta: string;
+}
+
+function arrayBufferOf(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer.slice(
+    bytes.byteOffset,
+    bytes.byteOffset + bytes.byteLength,
+  ) as ArrayBuffer;
+}
+
+async function uploadFile(input: UploadFileInput): Promise<void> {
+  const headers = new Headers();
+  headers.set("Content-Type", "application/octet-stream");
+  headers.set("X-File-Meta", input.encMeta);
+
+  const token = currentCsrfToken();
+  if (token) headers.set("X-CSRF-Token", token);
+
+  const query = new URLSearchParams({
+    pasteId: input.pasteId,
+    fileId: input.fileId,
+    size: String(input.encrypted.byteLength),
+  });
+
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 120_000);
+
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}/files?${query.toString()}`, {
+      method: "POST",
+      headers,
+      body: arrayBufferOf(input.encrypted),
+      credentials: "include",
+      cache: "no-store",
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new ApiError("The file upload timed out", 0, "TIMEOUT");
+    }
+    throw new ApiError("Cannot reach the server", 0, "NETWORK");
+  } finally {
+    window.clearTimeout(timeout);
+  }
+
+  if (!response.ok) throw await errorFromResponse(response);
+}
+
+function subscribeEvents(listener: (event: PasteEvent) => void): () => void {
+  if (typeof window === "undefined") return () => {};
+
+  let socket: WebSocket | null = null;
+  let closed = false;
+  let retryTimer: number | null = null;
+  let attempt = 0;
+
+  const connect = () => {
+    if (closed) return;
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    socket = new WebSocket(`${protocol}//${window.location.host}/api/events`);
+
+    socket.addEventListener("open", () => {
+      attempt = 0;
+    });
+
+    socket.addEventListener("message", (message) => {
+      if (typeof message.data !== "string") return;
+      try {
+        const event = JSON.parse(message.data) as Partial<PasteEvent>;
+        if (typeof event.type === "string" && typeof event.pasteId === "string") {
+          listener({ type: event.type, pasteId: event.pasteId });
+        }
+      } catch {
+        // The event channel is notification-only; ignore malformed messages.
+      }
+    });
+
+    socket.addEventListener("close", () => {
+      socket = null;
+      if (closed) return;
+      const delay = Math.min(30_000, 1_000 * 2 ** Math.min(attempt, 5));
+      attempt += 1;
+      retryTimer = window.setTimeout(connect, delay);
+    });
+
+    socket.addEventListener("error", () => {
+      socket?.close();
+    });
+  };
+
+  connect();
+
+  return () => {
+    closed = true;
+    if (retryTimer != null) window.clearTimeout(retryTimer);
+    socket?.close();
+    socket = null;
+  };
+}
+
+function assertAuthSession(
+  response: AuthSessionResponse,
+): AuthSessionResponse {
+  if (typeof response.csrfToken !== "string" || !response.csrfToken) {
+    throw new ApiError(
+      "The server did not return a valid session",
+      502,
+      "INVALID_RESPONSE",
+    );
+  }
+  return response;
 }
 
 export const api = {
   auth: {
-    login: (passphrase: string) =>
-      request<{ success: boolean }>("/auth/login", {
-        method: "POST",
-        body: JSON.stringify({ passphrase }),
-      }),
-
-    logout: () =>
-      request<{ success: boolean }>("/auth/logout", { method: "POST" }),
-
-    check: () => {
-      return request<{ authenticated: boolean }>("/auth/login");
+    params: () => request<AuthParams>("/auth/params"),
+    setup: async (body: {
+      authKey: string;
+      kdfSalt: string;
+      kdfParams: KdfParams;
+      wrappedVaultKey: string;
+    }) => {
+      const response = assertAuthSession(
+        await jsonRequest<AuthSessionResponse>("/auth/setup", "POST", body),
+      );
+      setCsrfToken(response.csrfToken);
+      return response;
     },
-
-    getSalt: () => request<{ salt: string }>("/auth/salt"),
-  },
-
-  paste: {
-    list: async (page = 1, limit = 20): Promise<PasteListResponse> => {
-      return request<PasteListResponse>(`/paste?page=${page}&limit=${limit}`);
+    login: async (body: { authKey: string }) => {
+      const response = assertAuthSession(
+        await jsonRequest<AuthSessionResponse>("/auth/login", "POST", body),
+      );
+      setCsrfToken(response.csrfToken);
+      return response;
     },
-
-    get: async (slug: string): Promise<{ paste: Paste; files: FileEntry[] }> => {
-      return request<{ paste: Paste; files: FileEntry[] }>(`/paste/${slug}`);
-    },
-
-    create: (data: {
-      title?: string;
-      content: string;
-      language?: string;
-      pinned?: number;
-      burn_trigger?: 'time' | 'unlock_count' | null;
-      burn_action?: 'revoke_share' | 'delete';
-      burn_after_value?: number;
-      burn_after_unit?: 'minute' | 'hour' | 'day';
-      burn_after_unlocks?: number;
-      file_slugs?: string[];
-      encrypted_paste_key?: string;
+    vault: () => request<VaultResponse>("/vault"),
+    changePassphrase: (body: {
+      oldAuthKey: string;
+      newAuthKey: string;
+      newKdfSalt: string;
+      newKdfParams: KdfParams;
+      newWrappedVaultKey: string;
     }) =>
-      request<{ success: boolean; slug: string }>("/paste", {
-        method: "POST",
-        body: JSON.stringify(data),
-      }),
-
-    update: (
-      slug: string,
-      data: {
-        title?: string;
-        content?: string;
-        language?: string;
-        pinned?: number;
-        burn_trigger?: 'time' | 'unlock_count' | null;
-      burn_action?: 'revoke_share' | 'delete';
-      burn_after_value?: number;
-      burn_after_unit?: 'minute' | 'hour' | 'day';
-      burn_after_unlocks?: number;
-        new_file_slugs?: string[];
-        removed_file_slugs?: string[];
-        encrypted_paste_key?: string;
-        share_wrapped_paste_key?: string;
-        share_auth_salt?: string;
-        share_auth_verifier?: string;
-      },
-    ) =>
-      request<{ success: boolean }>(`/paste/${slug}`, {
-        method: "PUT",
-        body: JSON.stringify(data),
-      }),
-
-    delete: (slug: string) =>
-      request<{ success: boolean }>(`/paste/${slug}`, {
-        method: "DELETE",
-      }),
-
-    pin: (slug: string, pinned: boolean) =>
-      request<{ success: boolean }>(`/paste/${slug}`, {
-        method: "PUT",
-        body: JSON.stringify({ pinned: pinned ? 1 : 0 }),
-      }),
-
-    share: (
-      slug: string,
-      shareWrappedPasteKey: string,
-      shareAuthSalt: string,
-      shareAuthVerifier: string,
-    ) =>
-      request<{ success: boolean }>(`/paste/${slug}`, {
-        method: "PUT",
-        body: JSON.stringify({
-          share_wrapped_paste_key: shareWrappedPasteKey,
-          share_auth_salt: shareAuthSalt,
-          share_auth_verifier: shareAuthVerifier,
-        }),
-      }),
-
-    revoke: (slug: string) =>
-      request<{ success: boolean }>(`/paste/${slug}`, {
-        method: "PUT",
-        body: JSON.stringify({ revoke_share: true }),
-      }),
-
-    /**
-     * Rate-limited unlock: POST /api/paste/:slug/unlock
-     * Sends the browser-derived auth_secret (NOT the plaintext access code).
-     * Server verifies auth_secret via slow hash and returns share_wrapped_paste_key
-     * plus the full encrypted paste payload on success.
-     * Throws an Error with message "TOO_MANY_ATTEMPTS" on HTTP 429.
-     */
-    unlock: async (
-      slug: string,
-      authSecret: string,
-    ): Promise<{ share_wrapped_paste_key: string; paste: any; files: any[] }> => {
-      const controller = new AbortController();
-      const id = setTimeout(() => controller.abort(), 10000);
-      try {
-        const res = await fetch(`${API_BASE}/paste/${slug}/unlock`, {
-          method: "POST",
-          signal: controller.signal,
-          credentials: "include",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ auth_secret: authSecret }),
-        });
-        clearTimeout(id);
-        let data: unknown;
-        try {
-          data = await res.json();
-        } catch {
-          throw new Error(`Server error (${res.status})`);
-        }
-        if (res.status === 429) throw new Error("TOO_MANY_ATTEMPTS");
-        if (!res.ok)
-          throw new Error(
-            (data as { error?: string }).error || "Unlock failed",
-          );
-        return data as { share_wrapped_paste_key: string; paste: any; files: any[] };
-      } catch (err) {
-        clearTimeout(id);
-        if (err instanceof Error) throw err;
-        throw new Error(String(err));
-      }
+      jsonRequest<{ success: boolean }>(
+        "/auth/change-passphrase",
+        "POST",
+        body,
+      ),
+    logout: async () => {
+      const response = await jsonRequest<{ success: boolean }>(
+        "/auth/logout",
+        "POST",
+      );
+      setCsrfToken(null);
+      return response;
     },
   },
 
-  file: {
-    getFileUrl: (slug: string): string => `${API_BASE}/file/${slug}`,
-
-    upload: async (
-      file: Blob,
-      encName: string,
-      encMime: string,
-    ): Promise<{
-      slug: string;
-      file_name: string;
-      mime_type: string;
-      file_size: number;
-    }> => {
-      const formData = new FormData();
-      formData.append("file", file, "encrypted_file");
-      formData.append("file_name", encName);
-      formData.append("mime_type", encMime);
-
-      const controller = new AbortController();
-      const id = setTimeout(() => controller.abort(), 60000); // 60s timeout for uploads
-
-      try {
-        const res = await fetch(`${API_BASE}/file/upload`, {
-          method: "POST",
-          body: formData,
-          signal: controller.signal,
-          credentials: "include",
-        });
-        clearTimeout(id);
-
-        let json: unknown;
-        try {
-          json = await res.json();
-        } catch {
-          throw new Error(`Server error (${res.status})`);
-        }
-        if (!res.ok)
-          throw new Error(
-            (json as { error?: string }).error || "Upload failed",
-          );
-        return json as {
-          slug: string;
-          file_name: string;
-          mime_type: string;
-          file_size: number;
-        };
-      } catch (err) {
-        clearTimeout(id);
-        if (err instanceof Error) throw err;
-        throw new Error(String(err));
-      }
+  pastes: {
+    list: (page = 1, limit = 20) =>
+      request<PasteListResponse>(
+        `/pastes?page=${encodeURIComponent(page)}&limit=${encodeURIComponent(limit)}`,
+      ),
+    get: async (id: string) => {
+      const response = await request<{ paste: PasteDetail }>(
+        `/pastes/${encodeURIComponent(id)}`,
+      );
+      return response.paste;
     },
+    create: async (body: CreatePasteInput) => {
+      const response = await jsonRequest<{ paste: PasteSummary }>(
+        "/pastes",
+        "POST",
+        body,
+      );
+      return response.paste;
+    },
+    update: async (id: string, body: UpdatePasteInput) => {
+      const response = await jsonRequest<{ paste: PasteSummary }>(
+        `/pastes/${encodeURIComponent(id)}`,
+        "PUT",
+        body,
+      );
+      return response.paste;
+    },
+    delete: (id: string) =>
+      jsonRequest<{ success: boolean }>(
+        `/pastes/${encodeURIComponent(id)}`,
+        "DELETE",
+      ),
+  },
 
-    delete: (slug: string) =>
-      request<{ success: boolean }>(`/file/${slug}`, {
-        method: "DELETE",
-      }),
+  share: {
+    status: (pasteId: string) =>
+      request<ShareStatusResponse>(
+        `/pastes/${encodeURIComponent(pasteId)}/share`,
+      ),
+    create: (pasteId: string, body: CreateShareInput) =>
+      jsonRequest<{ success: boolean; share: ShareInfo }>(
+        `/pastes/${encodeURIComponent(pasteId)}/share`,
+        "POST",
+        body,
+      ),
+    delete: (pasteId: string) =>
+      jsonRequest<{ success: boolean }>(
+        `/pastes/${encodeURIComponent(pasteId)}/share`,
+        "DELETE",
+      ),
+  },
+
+  guest: {
+    params: (pasteId: string) =>
+      request<ShareParams>(
+        `/shares/${encodeURIComponent(pasteId)}/params`,
+      ),
+    challenge: (pasteId: string) =>
+      jsonRequest<ChallengeResponse>(
+        `/shares/${encodeURIComponent(pasteId)}/challenge`,
+        "POST",
+      ),
+    unlock: (pasteId: string, body: { nonce: string; proof: string }) =>
+      jsonRequest<UnlockResponse>(
+        `/shares/${encodeURIComponent(pasteId)}/unlock`,
+        "POST",
+        body,
+      ),
+    view: (pasteId: string, shareToken: string) =>
+      jsonRequest<ViewResponse>(
+        `/shares/${encodeURIComponent(pasteId)}/view`,
+        "POST",
+        { shareToken },
+      ),
+  },
+
+  files: {
+    upload: uploadFile,
+    download: downloadFile,
   },
 
   events: {
-    /**
-     * Subscribe to real-time paste events via WebSocket.
-     * Returns an unsubscribe function to close the connection.
-     */
-    subscribe(
-      onEvent: (event: { type: string; slug?: string }) => void,
-    ): () => void {
-      // No live sync when offline
-      if (!navigator.onLine) {
-        return () => {};
-      }
-
-      let ws: WebSocket | null = null;
-      let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-      let pingTimer: ReturnType<typeof setInterval> | null = null;
-      let closed = false;
-
-      function connect() {
-        if (closed) return;
-
-        // Build WebSocket URL.
-        // In dev, Vite proxies HTTP but WS upgrade through http-proxy
-        // can be flaky with Bun — connect directly to the API server.
-        const proto = location.protocol === "https:" ? "wss:" : "ws:";
-        const wsUrl = import.meta.env.DEV
-          ? `ws://127.0.0.1:8788${API_BASE}/stream`
-          : `${proto}//${location.host}${API_BASE}/stream`;
-
-        ws = new WebSocket(wsUrl);
-
-        ws.onopen = () => {
-          // Send periodic pings to keep connection alive
-          // (DO auto-responds with "pong" without waking)
-          pingTimer = setInterval(() => {
-            if (ws?.readyState === WebSocket.OPEN) {
-              ws.send("ping");
-            }
-          }, 30_000);
-        };
-
-        ws.onmessage = (e) => {
-          // Ignore pong responses
-          if (e.data === "pong") return;
-          try {
-            const data = JSON.parse(e.data);
-            onEvent(data);
-          } catch {
-            // ignore malformed messages
-          }
-        };
-
-        ws.onclose = () => {
-          cleanup();
-          // Auto-reconnect after 2s (unless intentionally closed)
-          if (!closed) {
-            reconnectTimer = setTimeout(connect, 2000);
-          }
-        };
-
-        ws.onerror = () => {
-          // onclose will fire after onerror — reconnect handled there
-        };
-      }
-
-      function cleanup() {
-        if (pingTimer) {
-          clearInterval(pingTimer);
-          pingTimer = null;
-        }
-        if (reconnectTimer) {
-          clearTimeout(reconnectTimer);
-          reconnectTimer = null;
-        }
-      }
-
-      connect();
-
-      // Return unsubscribe function
-      return () => {
-        closed = true;
-        cleanup();
-        if (ws) {
-          ws.onclose = null; // prevent reconnect
-          ws.close();
-          ws = null;
-        }
-      };
-    },
+    subscribe: subscribeEvents,
   },
 };

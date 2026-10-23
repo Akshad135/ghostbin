@@ -1,10 +1,8 @@
-import { useState, useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '@/lib/auth';
-import { unwrapPasteKey, decryptText } from '@/lib/crypto';
-import { CodePreview } from '@/components/CodePreview';
-import type { Paste } from '@/lib/api';
-import { api } from '@/lib/api';
+import { api, ApiError, type PasteSummary } from '@/lib/api';
+import { decryptPasteTitleAndLanguage } from '@/lib/paste';
 import { burnStatusLabel, getLanguageLabel, timeAgo } from '@/lib/constants';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -19,18 +17,16 @@ import {
 } from '@/components/ui/dropdown-menu';
 import {
     Dialog,
+    DialogClose,
     DialogContent,
     DialogDescription,
+    DialogFooter,
     DialogHeader,
     DialogTitle,
-    DialogFooter,
-    DialogClose,
 } from '@/components/ui/dialog';
 import { MenuIcon } from '@/components/ui/animated-menu';
-import { CopyIcon } from '@/components/ui/animated-copy';
 import { LinkIcon } from '@/components/ui/animated-link';
 import { SquarePenIcon } from '@/components/ui/animated-square-pen';
-
 import { DeleteIcon } from '@/components/ui/animated-delete';
 import { FileTextIcon } from '@/components/ui/animated-file-text';
 import { ClockIcon } from '@/components/ui/animated-clock';
@@ -38,147 +34,121 @@ import { PinIcon } from '@/components/ui/animated-pin';
 import { HourglassIcon } from '@/components/ui/animated-hourglass';
 import { ShareIcon } from '@/components/ui/animated-share';
 import { LockIcon } from '@/components/ui/animated-lock';
+import { LoaderPinwheelIcon } from '@/components/ui/animated-loader-pinwheel';
 import { toast } from 'sonner';
 
 interface PasteCardProps {
-    paste: Paste;
-    isAuthenticated?: boolean;
-    onPinChange?: (slug: string, pinned: boolean) => void;
-    onDelete?: (slug: string) => void;
+    paste: PasteSummary;
+    onChanged?: () => void;
+    onDeleted?: (id: string) => void;
 }
 
-export function PasteCard({ paste, isAuthenticated = false, onPinChange, onDelete }: PasteCardProps) {
+export function PasteCard({ paste, onChanged, onDeleted }: PasteCardProps) {
     const navigate = useNavigate();
-    const { masterKey } = useAuth();
+    const { vaultKey, isAuthenticated } = useAuth();
+    const [title, setTitle] = useState('');
+    const [language, setLanguage] = useState('plaintext');
+    const [decrypting, setDecrypting] = useState(true);
     const [deleteOpen, setDeleteOpen] = useState(false);
-    const [decryptedTitle, setDecryptedTitle] = useState('');
-    const [decryptedContent, setDecryptedContent] = useState('');
+    const [deleting, setDeleting] = useState(false);
     const [shareDialogOpen, setShareDialogOpen] = useState(false);
-    const [localSharedKey, setLocalSharedKey] = useState<string | null | undefined>(paste.share_wrapped_paste_key);
-
-    useEffect(() => {
-        setLocalSharedKey(paste.share_wrapped_paste_key);
-    }, [paste.share_wrapped_paste_key]);
 
     useEffect(() => {
         let cancelled = false;
-        const decrypt = async () => {
-            if (!masterKey || !paste.encrypted_paste_key) {
+        setDecrypting(true);
+        if (!vaultKey) {
+            setTitle('Private paste');
+            setLanguage('plaintext');
+            setDecrypting(false);
+            return;
+        }
+        decryptPasteTitleAndLanguage(vaultKey, paste)
+            .then((result) => {
                 if (!cancelled) {
-                    setDecryptedTitle(paste.slug);
-                    setDecryptedContent('Encrypted content...');
+                    setTitle(result.title || 'Untitled paste');
+                    setLanguage(result.language);
                 }
-                return;
-            }
-            try {
-                const pasteKey = await unwrapPasteKey(masterKey, paste.encrypted_paste_key);
-                const title = paste.title ? await decryptText(pasteKey, paste.title) : paste.slug;
-                const content = paste.content ? await decryptText(pasteKey, paste.content) : '';
+            })
+            .catch(() => {
                 if (!cancelled) {
-                    setDecryptedTitle(title);
-                    setDecryptedContent(content);
+                    setTitle('Unable to decrypt');
+                    setLanguage('plaintext');
                 }
-            } catch (e) {
-                if (!cancelled) {
-                    setDecryptedTitle(paste.slug);
-                    setDecryptedContent('Failed to decrypt');
-                }
-            }
-        };
-        decrypt();
+            })
+            .finally(() => {
+                if (!cancelled) setDecrypting(false);
+            });
         return () => { cancelled = true; };
-    }, [paste, masterKey]);
+    }, [vaultKey, paste]);
 
-
-
-    const togglePin = async (e?: React.MouseEvent) => {
-        e?.stopPropagation();
-        const newPinned = !paste.pinned;
+    const togglePin = async () => {
         try {
-            await api.paste.pin(paste.slug, newPinned);
-            onPinChange?.(paste.slug, newPinned);
-            toast.success(newPinned ? 'Paste pinned' : 'Paste unpinned');
-        } catch (err) {
-            const message = err instanceof Error ? err.message : 'Failed to update pin status';
-            toast.error(message);
+            await api.pastes.update(paste.id, { pinned: !paste.pinned });
+            toast.success(paste.pinned ? 'Paste unpinned' : 'Paste pinned');
+            onChanged?.();
+        } catch (error) {
+            toast.error(error instanceof Error ? error.message : 'Failed to update pin');
         }
     };
 
     const handleDelete = async () => {
+        setDeleting(true);
         try {
-            await api.paste.delete(paste.slug);
-            onDelete?.(paste.slug);
+            await api.pastes.delete(paste.id);
+            setDeleteOpen(false);
             toast.success('Paste deleted');
-        } catch {
-            toast.error('Failed to delete');
-        }
-    };
-
-    const handleRevoke = async () => {
-        try {
-            await api.paste.revoke(paste.slug);
-            setLocalSharedKey(null);
-            toast.success('Share access revoked');
-        } catch {
-            toast.error('Failed to revoke share');
-        }
-    };
-
-    const copyContent = async () => {
-        try {
-            if (!decryptedContent.trim()) {
-                toast.info('No text content to copy');
-                return;
+            onDeleted?.(paste.id);
+        } catch (error) {
+            if (error instanceof ApiError && error.status === 404) {
+                onDeleted?.(paste.id);
+            } else {
+                toast.error(error instanceof Error ? error.message : 'Failed to delete paste');
             }
-            await navigator.clipboard.writeText(decryptedContent);
-            toast.success('Copied to clipboard!');
-        } catch {
-            toast.error('Failed to copy content');
+        } finally {
+            setDeleting(false);
         }
     };
 
-    const shareLink = async (e?: React.MouseEvent) => {
-        e?.stopPropagation();
-        const url = `${window.location.origin}/paste/${paste.slug}`;
-        await navigator.clipboard.writeText(url);
-        toast.success('Link copied!');
+    const copyOwnerLink = async () => {
+        try {
+            await navigator.clipboard.writeText(`${window.location.origin}/p/${paste.id}`);
+            toast.success('Owner link copied');
+        } catch {
+            toast.error('Failed to copy link');
+        }
     };
 
-    const rawContent = decryptedContent.slice(0, 500);
-    const hasFiles = paste.file_count !== undefined && paste.file_count > 0;
     const burnLabel = burnStatusLabel(paste, true);
+    const hasFiles = paste.fileCount > 0;
 
     return (
         <>
             <Card
                 className="group cursor-pointer transition-all duration-200 hover:shadow-lg hover:shadow-primary/5 hover:border-primary/30 border-border/60 h-full flex flex-col"
-                onClick={() => navigate(`/paste/${paste.slug}`)}
+                onClick={() => navigate(`/p/${paste.id}`)}
             >
                 <CardContent className="p-3 gap-2 flex-1 flex flex-col">
-                    {/* Header: title + badges + menu all in one row */}
                     <div className="flex items-center gap-1.5">
-                        {paste.pinned === 1 && (
+                        {paste.pinned && (
                             <PinIcon size={14} className="text-primary shrink-0 rotate-45" />
                         )}
                         <h3 className="font-medium text-sm truncate text-foreground flex-1 min-w-0">
-                            {decryptedTitle}
+                            {decrypting ? 'Decrypting…' : title}
                         </h3>
-                        
+
                         {hasFiles && (
                             <Badge variant="outline" className="text-[10px] px-1.5 py-0.5 shrink-0 gap-1 border-primary/20 bg-primary/5 text-primary">
                                 <FileTextIcon size={10} />
-                                {paste.file_count}
+                                {paste.fileCount}
                             </Badge>
                         )}
-                        
-                        <Badge variant="default" className="text-[10px] px-1.5 py-0.5 shrink-0">
-                            {getLanguageLabel(paste.language)}
-                        </Badge>
-                        
 
-                        
+                        <Badge variant="default" className="text-[10px] px-1.5 py-0.5 shrink-0">
+                            {getLanguageLabel(language)}
+                        </Badge>
+
                         <DropdownMenu>
-                            <DropdownMenuTrigger asChild onClick={(e: React.MouseEvent) => e.stopPropagation()}>
+                            <DropdownMenuTrigger asChild onClick={(event) => event.stopPropagation()}>
                                 <Button
                                     variant="ghost"
                                     size="icon"
@@ -187,32 +157,19 @@ export function PasteCard({ paste, isAuthenticated = false, onPinChange, onDelet
                                     <MenuIcon size={14} />
                                 </Button>
                             </DropdownMenuTrigger>
-                            <DropdownMenuContent align="end" onClick={(e: React.MouseEvent) => e.stopPropagation()}>
-                                <DropdownMenuItem onClick={copyContent}>
-                                    <CopyIcon size={14} className="mr-2 text-primary" /> Copy content
-                                </DropdownMenuItem>
-                                <DropdownMenuItem onClick={shareLink}>
-                                    <LinkIcon size={14} className="mr-2 text-primary" /> Share link
+                            <DropdownMenuContent align="end" onClick={(event) => event.stopPropagation()}>
+                                <DropdownMenuItem onClick={copyOwnerLink}>
+                                    <LinkIcon size={14} className="mr-2 text-primary" /> Copy owner link
                                 </DropdownMenuItem>
                                 {isAuthenticated && (
                                     <>
-                                        <DropdownMenuSeparator />
-                                        
-                                        {localSharedKey ? (
-                                            <DropdownMenuItem onClick={(e) => { e.stopPropagation(); handleRevoke(); }} className="text-destructive focus:text-destructive">
-                                                <LockIcon size={14} className="mr-2" /> Revoke access
-                                            </DropdownMenuItem>
-                                        ) : (
-                                            <DropdownMenuItem onClick={(e) => { e.stopPropagation(); setShareDialogOpen(true); }}>
-                                                <ShareIcon size={14} className="mr-2" /> Share with PIN
-                                            </DropdownMenuItem>
-                                        )}
-                                        
-                                        <DropdownMenuItem onClick={() => navigate(`/edit/${paste.slug}`)}>
+                                        <DropdownMenuItem onClick={() => setShareDialogOpen(true)}>
+                                            <ShareIcon size={14} className="mr-2" /> Share
+                                        </DropdownMenuItem>
+                                        <DropdownMenuItem onClick={() => navigate(`/edit/${paste.id}`)}>
                                             <SquarePenIcon size={14} className="mr-2" /> Edit
                                         </DropdownMenuItem>
-
-                                        <DropdownMenuItem onClick={() => togglePin()}>
+                                        <DropdownMenuItem onClick={togglePin}>
                                             <PinIcon size={14} className="mr-2" />
                                             {paste.pinned ? 'Unpin' : 'Pin'}
                                         </DropdownMenuItem>
@@ -229,24 +186,25 @@ export function PasteCard({ paste, isAuthenticated = false, onPinChange, onDelet
                         </DropdownMenu>
                     </div>
 
-                    {/* Code preview or file indicator */}
-                    {rawContent.trim() ? (
-                        <CodePreview code={rawContent} language={paste.language} />
-                    ) : hasFiles ? (
-                        <div className="flex-1 flex items-center justify-center rounded-md border border-dashed border-border/40 bg-muted/10 py-6 gap-2 text-muted-foreground">
-                            <FileTextIcon size={16} className="text-primary/60" />
-                            <span className="text-xs font-medium">{paste.file_count} {paste.file_count === 1 ? 'file' : 'files'} attached</span>
-                        </div>
-                    ) : (
-                        <CodePreview code={rawContent} language={paste.language} />
-                    )}
+                    <div className="flex-1 flex flex-col items-center justify-center rounded-md border border-dashed border-border/40 bg-muted/10 py-6 gap-2 text-muted-foreground">
+                        {decrypting ? (
+                            <LoaderPinwheelIcon size={18} className="animate-spin text-primary/60" />
+                        ) : (
+                            <LockIcon size={18} className="text-primary/60" />
+                        )}
+                        <span className="text-xs font-medium">
+                            {hasFiles
+                                ? `${paste.fileCount} encrypted file${paste.fileCount === 1 ? '' : 's'}`
+                                : 'Encrypted paste'}
+                        </span>
+                        <span className="text-[10px]">Open to decrypt</span>
+                    </div>
 
-                    {/* Footer */}
                     <div className="flex items-center justify-between text-[11px] text-muted-foreground mt-auto">
                         <div className="flex items-center gap-2 min-w-0">
                             <span className="flex items-center gap-1 shrink-0">
                                 <ClockIcon size={12} className="text-primary/60" />
-                                {timeAgo(paste.created_at)}
+                                {timeAgo(paste.createdAt)}
                             </span>
                             {burnLabel && (
                                 <span className="flex items-center gap-1 text-amber-500 truncate">
@@ -255,47 +213,39 @@ export function PasteCard({ paste, isAuthenticated = false, onPinChange, onDelet
                                 </span>
                             )}
                         </div>
-                        <span className="font-mono truncate ml-2">{paste.slug}</span>
+                        <span className="font-mono truncate ml-2">{paste.id.slice(0, 8)}</span>
                     </div>
                 </CardContent>
             </Card>
 
-            {/* Delete confirmation dialog */}
             <Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>
-                <DialogContent onClick={(e: React.MouseEvent) => e.stopPropagation()}>
+                <DialogContent onClick={(event) => event.stopPropagation()}>
                     <DialogHeader>
                         <DialogTitle>Delete Paste</DialogTitle>
                         <DialogDescription>
-                            Are you sure you want to delete <span className="font-semibold text-foreground">{decryptedTitle}</span>? This action cannot be undone.
-                            {hasFiles && " This will also delete all attached files."}
+                            Delete <span className="font-semibold text-foreground">{title}</span>?
+                            This removes the paste, its share, and all encrypted files. It cannot be undone.
                         </DialogDescription>
                     </DialogHeader>
                     <DialogFooter className="gap-2 sm:gap-0">
                         <DialogClose asChild>
-                            <Button variant="outline">Cancel</Button>
+                            <Button variant="outline" disabled={deleting}>Cancel</Button>
                         </DialogClose>
-                        <Button
-                            variant="destructive"
-                            onClick={() => {
-                                setDeleteOpen(false);
-                                handleDelete();
-                            }}
-                        >
-                            <DeleteIcon size={16} className="mr-1.5" />
+                        <Button variant="destructive" onClick={handleDelete} disabled={deleting}>
+                            {deleting
+                                ? <LoaderPinwheelIcon size={16} className="mr-1.5 animate-spin" />
+                                : <DeleteIcon size={16} className="mr-1.5" />}
                             Delete
                         </Button>
                     </DialogFooter>
                 </DialogContent>
             </Dialog>
 
-            {/* Share paste dialog */}
             <SharePasteDialog
                 open={shareDialogOpen}
                 onOpenChange={setShareDialogOpen}
-                pasteSlug={paste.slug}
-                encryptedPasteKey={paste.encrypted_paste_key || ''}
-                burnAction={paste.burn_action}
-                onSuccess={(sharedKey) => setLocalSharedKey(sharedKey)}
+                paste={paste}
+                onChanged={onChanged}
             />
         </>
     );

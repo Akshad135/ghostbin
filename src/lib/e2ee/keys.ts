@@ -3,6 +3,7 @@ import { VAULT_AAD } from "./aad.ts";
 import {
   bytesToBase64Url,
   randomBytes,
+  sha256,
   toArrayBuffer,
   utf8,
 } from "./bytes.ts";
@@ -17,6 +18,8 @@ const FILE_ID_BYTES = 16;
 const AUTH_INFO = "ghostbin/auth/v1";
 const MASTER_INFO = "ghostbin/enc/v1";
 const PASTE_INFO = "ghostbin/paste/v1|";
+const CANARY_INFO = "ghostbin/canary/v1";
+const CANARY_LABEL = "ghostbin/vault-canary/v1";
 
 async function importHkdfKey(
   bytes: Uint8Array,
@@ -100,6 +103,46 @@ export async function importVaultKey(
     throw new Error("importVaultKey: vault key must be 32 bytes");
   }
   return importHkdfKey(vaultKey, ["deriveBits"]);
+}
+
+/**
+ * Self-check value for a cached vault key handle. Derived from the handle
+ * itself, so a stored canary that does not match a recomputed one proves the
+ * cached record is corrupt or was tampered with.
+ */
+export async function vaultCanary(vaultKey: CryptoKey): Promise<string> {
+  const bits = await crypto.subtle.deriveBits(
+    {
+      name: "HKDF",
+      hash: HKDF_HASH,
+      salt: toArrayBuffer(new Uint8Array(0)),
+      info: toArrayBuffer(utf8(CANARY_INFO)),
+    },
+    vaultKey,
+    AES_KEY_BITS,
+  );
+  const hmacKey = await crypto.subtle.importKey(
+    "raw",
+    bits,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const mac = await crypto.subtle.sign(
+    "HMAC",
+    hmacKey,
+    toArrayBuffer(utf8(CANARY_LABEL)),
+  );
+  return bytesToBase64Url(new Uint8Array(mac));
+}
+
+/**
+ * Version stamp for the cached vault key: a hash of the current wrapped
+ * vault key envelope. Any vault-affecting change (passphrase change, vault
+ * reset, new setup) produces a new envelope and therefore a new stamp.
+ */
+export async function vaultStamp(wrappedVaultKey: string): Promise<string> {
+  return bytesToBase64Url(await sha256(utf8(wrappedVaultKey)));
 }
 
 export async function derivePasteKeyBytes(
