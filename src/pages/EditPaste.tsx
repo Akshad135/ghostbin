@@ -103,7 +103,7 @@ function burnDisplay(paste: PasteDetail): {
 export function EditPaste() {
     const { id } = useParams<{ id: string }>();
     const navigate = useNavigate();
-    const { isAuthenticated, vaultKey, isLoading: authLoading } = useAuth();
+    const { isAuthenticated, vaultKey, isLoading: authLoading, checkAuth } = useAuth();
 
     const [paste, setPaste] = useState<PasteDetail | null>(null);
     const [pasteKey, setPasteKey] = useState<CryptoKey | null>(null);
@@ -112,6 +112,7 @@ export function EditPaste() {
     const [hasShare, setHasShare] = useState(false);
     const [loading, setLoading] = useState(true);
     const [notFound, setNotFound] = useState(false);
+    const [loadError, setLoadError] = useState('');
     const [title, setTitle] = useState('');
     const [content, setContent] = useState('');
     const [language, setLanguage] = useState('plaintext');
@@ -139,6 +140,7 @@ export function EditPaste() {
         let cancelled = false;
         const load = async () => {
             setLoading(true);
+            setLoadError('');
             try {
                 const detail = await api.pastes.get(id);
                 const status = await api.share.status(id).catch(() => ({ exists: false as const }));
@@ -182,8 +184,13 @@ export function EditPaste() {
                 if (cancelled) return;
                 if (error instanceof ApiError && (error.status === 404 || error.status === 410)) {
                     setNotFound(true);
+                } else if (error instanceof ApiError && error.status === 401) {
+                    setLoadError('Your session expired. Unlock your vault again.');
+                    // Re-run the auth check so the whole app locks consistently.
+                    void checkAuth();
                 } else {
-                    toast.error(error instanceof Error ? error.message : 'Failed to load paste');
+                    // Transient failures must not masquerade as "not found".
+                    setLoadError(error instanceof Error ? error.message : 'Failed to load paste');
                 }
             } finally {
                 if (!cancelled) setLoading(false);
@@ -191,7 +198,7 @@ export function EditPaste() {
         };
         void load();
         return () => { cancelled = true; };
-    }, [id, isAuthenticated, vaultKey, authLoading, navigate, reloadKey]);
+    }, [id, isAuthenticated, vaultKey, authLoading, navigate, reloadKey, checkAuth]);
 
     const existingSize = existingFiles.reduce((sum, file) => sum + file.meta.size, 0);
     const stagedEstimate = stagedFiles.reduce((sum, file) => sum + file.file.size + 28, 0);
@@ -403,6 +410,7 @@ export function EditPaste() {
         );
     }
     if (notFound) return <ErrorState type="not-found" />;
+    if (loadError) return <ErrorState type="error" error={loadError} />;
     if (!paste || !pasteKey) return <ErrorState type="not-found" />;
 
     return (

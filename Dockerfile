@@ -27,15 +27,25 @@ WORKDIR /app
 # Install dependencies for sqlx and compilation
 RUN apk add --no-cache musl-dev sqlite-dev pkgconfig
 
-# Copy Cargo files and source
+ARG TARGETPLATFORM
+
+# Pre-build the dependency graph into this layer. CI builders are
+# ephemeral, so cache mounts do not survive between runs — dependency
+# caching there relies on layer caching, which only hits while this
+# layer stays unchanged (i.e. Cargo.toml/Cargo.lock did not change).
 COPY Cargo.toml Cargo.lock* ./
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETPLATFORM} \
+    mkdir -p src-rust && \
+    echo 'fn main() {}' > src-rust/main.rs && \
+    cargo build --release --locked && \
+    rm -rf src-rust
+
+# Copy the real sources and rebuild — only the crate itself recompiles.
+# (No /app/target cache mount here: it would shadow the pre-built
+# dependencies baked into the layer above.)
 COPY src-rust ./src-rust
 COPY schema.sql ./
-
-# Build release binary
-ARG TARGETPLATFORM
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETPLATFORM} \
-    --mount=type=cache,target=/app/target,id=cargo-target-${TARGETPLATFORM} \
     cargo build --release --locked && \
     cp /app/target/release/ghostbin-server /app/ghostbin-server_built
 

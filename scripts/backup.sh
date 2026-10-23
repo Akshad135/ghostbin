@@ -32,7 +32,18 @@ echo "wrote ${SNAPSHOT}"
 
 if [ -d "$UPLOADS_DIR" ]; then
     ARCHIVE="${OUTPUT_DIR}/uploads-${STAMP}.tar.gz"
-    tar -czf "$ARCHIVE" -C "$DATA_DIR" "$(basename "$UPLOADS_DIR")"
+    # Same-second reruns must not silently overwrite the previous archive.
+    [ -e "$ARCHIVE" ] && ARCHIVE="${OUTPUT_DIR}/uploads-${STAMP}-$$.tar.gz"
+    # Uploads can be deleted while tar runs (burn/reconcile). Exit 1 from
+    # GNU tar means files changed or vanished during the read — keep the
+    # archive but say so loudly; anything worse is fatal.
+    tar_status=0
+    tar --ignore-failed-read -czf "$ARCHIVE" -C "$DATA_DIR" "$(basename "$UPLOADS_DIR")" || tar_status=$?
+    if [ "$tar_status" -eq 1 ]; then
+        echo "warning: uploads changed during backup; ${ARCHIVE} may be incomplete" >&2
+    elif [ "$tar_status" -ne 0 ]; then
+        exit "$tar_status"
+    fi
     echo "wrote ${ARCHIVE}"
 fi
 

@@ -241,6 +241,7 @@ pub async fn handle_params(State(state): State<Arc<AppState>>) -> Response {
 /// POST /api/auth/setup — one-time vault setup.
 pub async fn handle_setup(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<SetupBody>,
 ) -> Response {
@@ -252,10 +253,39 @@ pub async fn handle_setup(
         );
     }
 
+    // Once the vault is claimed, answer every setup request identically
+    // before any token comparison — otherwise the 403-vs-409 difference
+    // would let an attacker verify SETUP_TOKEN guesses against a server
+    // that is already configured.
+    match load_settings(&state.db).await {
+        Ok(Some(_)) => {
+            return api_error(
+                StatusCode::CONFLICT,
+                "ALREADY_CONFIGURED",
+                "This server is already configured",
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::error!("Failed to check setup state: {error}");
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                "Failed to check setup state",
+            );
+        }
+    }
+
     // When SETUP_TOKEN is configured, only requests carrying it may claim
     // this fresh instance — otherwise a scanner that reaches the server
-    // before the owner could permanently squat the setup.
+    // before the owner could permanently squat the setup. Failed guesses
+    // share the login limiter so the token cannot be brute-forced at
+    // network speed during the deploy-to-claim window.
     if let Some(expected) = &state.setup_token {
+        let ip = state.client_ip(addr.ip(), &headers);
+        if let Some(retry_after) = login_retry_after(&state, ip) {
+            return rate_limited(retry_after);
+        }
         let provided = headers
             .get("x-setup-token")
             .and_then(|value| value.to_str().ok());
@@ -264,12 +294,14 @@ pub async fn handle_setup(
             provided.as_bytes().ct_eq(expected.as_bytes()).into()
         });
         if !matches {
+            record_login_failure(&state, ip);
             return api_error(
                 StatusCode::FORBIDDEN,
                 "SETUP_TOKEN_REQUIRED",
                 "A valid setup token is required to claim this server",
             );
         }
+        clear_login_failures(&state, ip);
     }
 
     let Some(auth_key) = auth::decode_base64url(&body.auth_key, auth::AUTH_KEY_BYTES) else {
@@ -296,25 +328,6 @@ pub async fn handle_setup(
             "wrappedVaultKey must be a v1 AES-GCM envelope",
         );
     };
-
-    match load_settings(&state.db).await {
-        Ok(Some(_)) => {
-            return api_error(
-                StatusCode::CONFLICT,
-                "ALREADY_CONFIGURED",
-                "This server is already configured",
-            );
-        }
-        Ok(None) => {}
-        Err(error) => {
-            tracing::error!("Failed to check setup state: {error}");
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL",
-                "Failed to check setup state",
-            );
-        }
-    }
 
     let auth_hash = auth::hash_auth_key(&auth_key);
     let kdf_params = match serde_json::to_string(&body.kdf_params) {
@@ -872,7 +885,7 @@ mod tests {
         let setup = setup_body();
         let auth_key = setup.auth_key.clone();
 
-        let response = handle_setup(State(state.clone()), HeaderMap::new(), Json(setup)).await;
+        let response = handle_setup(State(state.clone()), ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1234))), HeaderMap::new(), Json(setup)).await;
         assert_eq!(response.status(), StatusCode::CREATED);
         let setup_csrf = response_json(response).await["csrfToken"]
             .as_str()
@@ -914,10 +927,10 @@ mod tests {
     #[tokio::test]
     async fn setup_is_one_time() {
         let state = test_state().await;
-        let response = handle_setup(State(state.clone()), HeaderMap::new(), Json(setup_body())).await;
+        let response = handle_setup(State(state.clone()), ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1234))), HeaderMap::new(), Json(setup_body())).await;
         assert_eq!(response.status(), StatusCode::CREATED);
 
-        let response = handle_setup(State(state), HeaderMap::new(), Json(setup_body())).await;
+        let response = handle_setup(State(state), ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1234))), HeaderMap::new(), Json(setup_body())).await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
         assert_eq!(response_json(response).await["code"], "ALREADY_CONFIGURED");
     }
@@ -925,7 +938,7 @@ mod tests {
     #[tokio::test]
     async fn login_failures_are_rate_limited() {
         let state = test_state().await;
-        let response = handle_setup(State(state.clone()), HeaderMap::new(), Json(setup_body())).await;
+        let response = handle_setup(State(state.clone()), ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1234))), HeaderMap::new(), Json(setup_body())).await;
         assert_eq!(response.status(), StatusCode::CREATED);
 
         let bad_key = auth::encode_base64url(&[9u8; auth::AUTH_KEY_BYTES]);
@@ -956,7 +969,7 @@ mod tests {
     #[tokio::test]
     async fn login_failures_are_rate_limited_per_account() {
         let state = test_state().await;
-        let response = handle_setup(State(state.clone()), HeaderMap::new(), Json(setup_body())).await;
+        let response = handle_setup(State(state.clone()), ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1234))), HeaderMap::new(), Json(setup_body())).await;
         assert_eq!(response.status(), StatusCode::CREATED);
 
         let bad_key = auth::encode_base64url(&[9u8; auth::AUTH_KEY_BYTES]);
@@ -1007,7 +1020,7 @@ mod tests {
         let state = test_state().await;
         let setup = setup_body();
         let old_auth_key = setup.auth_key.clone();
-        let response = handle_setup(State(state.clone()), HeaderMap::new(), Json(setup)).await;
+        let response = handle_setup(State(state.clone()), ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1234))), HeaderMap::new(), Json(setup)).await;
         assert_eq!(response.status(), StatusCode::CREATED);
         let setup_cookies = response.headers().clone();
         let setup_session = set_cookie_value(&setup_cookies, auth::SESSION_COOKIE_NAME).unwrap();
@@ -1077,7 +1090,7 @@ mod tests {
         let state = test_state().await;
         let setup = setup_body();
         let good_key = setup.auth_key.clone();
-        let response = handle_setup(State(state.clone()), HeaderMap::new(), Json(setup)).await;
+        let response = handle_setup(State(state.clone()), ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1234))), HeaderMap::new(), Json(setup)).await;
         assert_eq!(response.status(), StatusCode::CREATED);
 
         let response = handle_login(
@@ -1155,18 +1168,91 @@ mod tests {
         assert_eq!(body["maxFileSize"], 1024);
 
         let response =
-            handle_setup(State(state.clone()), HeaderMap::new(), Json(setup_body())).await;
+            handle_setup(State(state.clone()), ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1234))), HeaderMap::new(), Json(setup_body())).await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(response_json(response).await["code"], "SETUP_TOKEN_REQUIRED");
 
         let mut headers = HeaderMap::new();
         headers.insert("x-setup-token", HeaderValue::from_static("wrong"));
-        let response = handle_setup(State(state.clone()), headers, Json(setup_body())).await;
+        let response = handle_setup(State(state.clone()), ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1234))), headers, Json(setup_body())).await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
         let mut headers = HeaderMap::new();
         headers.insert("x-setup-token", HeaderValue::from_static("correct-token"));
-        let response = handle_setup(State(state), headers, Json(setup_body())).await;
+        let response = handle_setup(State(state), ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1234))), headers, Json(setup_body())).await;
         assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn setup_answers_conflict_uniformly_once_claimed() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite");
+        crate::db::init_schema(&pool, crate::db::ResetDb::No)
+            .await
+            .expect("schema init");
+        let state = Arc::new(AppState::new(
+            pool,
+            "dist".to_string(),
+            "uploads".to_string(),
+            1024,
+            1024,
+            Vec::new(),
+            Some("correct-token".to_string()),
+        ));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-setup-token", HeaderValue::from_static("correct-token"));
+        let response = handle_setup(State(state.clone()), ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1234))), headers, Json(setup_body())).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        // Every follow-up setup request must get the same 409 — with the
+        // correct token, a wrong one, or none at all — so the response can
+        // never reveal whether a token guess was valid.
+        for token in ["correct-token", "wrong-token"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-setup-token", HeaderValue::from_static(token));
+            let response = handle_setup(State(state.clone()), ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1234))), headers, Json(setup_body())).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(response_json(response).await["code"], "ALREADY_CONFIGURED");
+        }
+        let response = handle_setup(State(state), ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1234))), HeaderMap::new(), Json(setup_body())).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn setup_token_failures_are_rate_limited() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite");
+        crate::db::init_schema(&pool, crate::db::ResetDb::No)
+            .await
+            .expect("schema init");
+        let state = Arc::new(AppState::new(
+            pool,
+            "dist".to_string(),
+            "uploads".to_string(),
+            1024,
+            1024,
+            Vec::new(),
+            Some("correct-token".to_string()),
+        ));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-setup-token", HeaderValue::from_static("wrong"));
+        for _ in 0..MAX_LOGIN_ATTEMPTS {
+            let response = handle_setup(State(state.clone()), ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1234))), headers.clone(), Json(setup_body())).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+
+        // The next guess from this IP is throttled before the comparison —
+        // the token cannot be brute-forced during the deploy-to-claim window.
+        let response = handle_setup(State(state), ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1234))), headers, Json(setup_body())).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().contains_key(header::RETRY_AFTER));
     }
 }

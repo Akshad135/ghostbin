@@ -18,6 +18,7 @@ export function Home() {
     const [page, setPage] = useState(1);
     const [hasMore, setHasMore] = useState(false);
     const [error, setError] = useState('');
+    const [pageError, setPageError] = useState('');
     const [loadTrigger, setLoadTrigger] = useState(0);
     const { isAuthenticated, isLoading: authLoading, configured, error: authError, checkAuth } = useAuth();
     const navigate = useNavigate();
@@ -46,21 +47,27 @@ export function Home() {
             }
             if (!hasLoadedOnce.current) setLoading(true);
             setError('');
+            setPageError('');
             try {
-                const result = await api.pastes.list(page, PAGE_SIZE);
-                if (cancelled) return;
-                if (page === 1) {
-                    setPastes(result.pastes);
-                } else {
-                    setPastes((previous) => {
-                        const seen = new Set(previous.map((paste) => paste.id));
-                        return [
-                            ...previous,
-                            ...result.pastes.filter((paste) => !seen.has(paste.id)),
-                        ];
-                    });
+                // Walk every loaded page, not just the latest one, so
+                // refreshes (SSE events, pin toggles, edits) pick up
+                // changes to pastes beyond the first page. First occurrence
+                // wins if a paste shifts between pages mid-walk.
+                const collected: PasteSummary[] = [];
+                const seen = new Set<string>();
+                let lastHasMore = false;
+                for (let current = 1; current <= page; current += 1) {
+                    const result = await api.pastes.list(current, PAGE_SIZE);
+                    if (cancelled) return;
+                    for (const paste of result.pastes) {
+                        if (seen.has(paste.id)) continue;
+                        seen.add(paste.id);
+                        collected.push(paste);
+                    }
+                    lastHasMore = result.hasMore;
                 }
-                setHasMore(result.hasMore);
+                setPastes(collected);
+                setHasMore(lastHasMore);
                 hasLoadedOnce.current = true;
             } catch (loadError) {
                 if (cancelled) return;
@@ -68,7 +75,15 @@ export function Home() {
                     void checkAuth();
                     return;
                 }
-                setError(loadError instanceof Error ? loadError.message : 'Failed to load pastes');
+                const message = loadError instanceof Error ? loadError.message : 'Failed to load pastes';
+                // Only the very first load gets the full-screen error;
+                // later failures keep the loaded grid visible with an
+                // inline retry instead of blanking it.
+                if (hasLoadedOnce.current) {
+                    setPageError(message);
+                } else {
+                    setError(message);
+                }
             } finally {
                 if (!cancelled) setLoading(false);
             }
@@ -178,6 +193,19 @@ export function Home() {
                 </div>
             ) : (
                 <>
+                    {pageError && (
+                        <div className="flex items-center justify-center gap-3 py-2 text-sm text-destructive">
+                            <span>{pageError}</span>
+                            <Button
+                                size="sm"
+                                variant="outline"
+                                disabled={loading}
+                                onClick={() => setLoadTrigger((value) => value + 1)}
+                            >
+                                Retry
+                            </Button>
+                        </div>
+                    )}
                     <div
                         className="grid gap-3 grid-cols-1 md:grid-cols-2 lg:grid-cols-4"
                         style={{ gridAutoRows: 'calc((100dvh - 7rem - 1px) / 3)' }}

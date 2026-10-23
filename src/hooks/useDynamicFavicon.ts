@@ -10,11 +10,12 @@ function ghostFaviconDataUri(color: string): string {
 }
 
 /**
- * Reads the computed --palette-accent CSS variable and converts HSL → hex.
+ * Reads the computed --primary CSS variable (set per palette/mode on the
+ * root element) and converts HSL → hex.
  */
 function getAccentColor(): string {
     const style = getComputedStyle(document.documentElement);
-    const raw = style.getPropertyValue('--palette-accent').trim();
+    const raw = style.getPropertyValue('--primary').trim();
     if (!raw) return '#a78bfa'; // fallback purple
 
     const parts = raw.split(/\s+/);

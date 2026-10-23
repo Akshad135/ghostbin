@@ -154,8 +154,17 @@ Do not publish the app port on all interfaces without TLS. Run the backend bound
 Use `scripts/backup.sh` — it snapshots the database with `VACUUM INTO` (safe while the server runs; never copy the live SQLite file, its WAL sidecars make a plain copy corruptible) and archives the uploads directory:
 
 ```bash
+# Native deployments that keep data in a host ./data directory:
 scripts/backup.sh ./data ./backups
 ```
+
+Container deployments keep data in the `ghostbin-data` volume, not a host directory — point the script at the volume's mount point instead:
+
+```bash
+scripts/backup.sh "$(podman volume inspect ghostbin-data --format '{{.Mountpoint}}')" ./backups
+```
+
+Rootless podman volumes live under `~/.local/share/containers/storage/volumes/` and are readable directly; rootful podman needs `sudo` for the volume path.
 
 ## License
 

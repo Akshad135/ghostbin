@@ -22,6 +22,9 @@ dist-ssr
 *.sqlite-shm
 salt.txt
 
+# Backup output (scripts/backup.sh) — encrypted uploads tarballs land here
+/backups/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
