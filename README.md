@@ -5,7 +5,7 @@
 ## Features
 
 - Backend powered by Rust and SQLite
-- Syntax highlighting for 50+ languages via [Shiki](https://shiki.style)
+- Syntax highlighting for 50+ languages via [@pierre/highlights](https://diffs.com/highlights), matched to the app's themes
 - File attachments with configurable size limits
 - End-to-End Encryption (E2EE) derived from your auth passphrase
 - Single-user authentication (no accounts needed)

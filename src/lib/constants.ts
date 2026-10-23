@@ -65,7 +65,10 @@ export const LANG_MAP: Record<string, string> = {
     vue: 'vue',
     svelte: 'svelte',
     astro: 'astro',
-    nginx: 'nginx',
+    // No INI or nginx lexer in @pierre/highlights; these are the closest
+    // structural matches (key=value sections / block directives).
+    ini: 'toml',
+    nginx: 'hcl',
 };
 
 export function getLanguageLabel(value: string): string {

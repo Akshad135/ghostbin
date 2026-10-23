@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, Fragment, type CSSProperties } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
-import { codeToTokensBase, type BundledLanguage, type SpecialLanguage } from 'shiki';
+import { codeToTokens, isSupportedLanguage } from '@pierre/highlights';
 import { useAuth } from '@/lib/auth';
+import { highlightThemeFor } from '@/lib/highlight';
 import {
     api,
     ApiError,
@@ -117,13 +118,6 @@ interface HighlightToken {
     fontStyle?: number;
 }
 
-interface HighlightState {
-    code: string;
-    language: string;
-    mode: string;
-    tokens: HighlightToken[][];
-}
-
 // Shiki fontStyle is a bitmask: 1 italic, 2 bold, 4 underline, 8 strike.
 function tokenStyle(token: HighlightToken): CSSProperties {
     const style: React.CSSProperties = {};
@@ -139,43 +133,24 @@ function tokenStyle(token: HighlightToken): CSSProperties {
 }
 
 function CodeBlock({ code, language }: { code: string; language: string }) {
-    const { mode } = useTheme();
-    const [highlight, setHighlight] = useState<HighlightState | null>(null);
+    const { mode, palette } = useTheme();
     const tooLarge = code.length > MAX_HIGHLIGHT_CHARS;
-    // Tokens are only rendered when they were computed for exactly the
-    // current inputs; anything stale falls back to the plain render.
-    const tokens =
-        highlight &&
-        highlight.code === code &&
-        highlight.language === language &&
-        highlight.mode === mode
-            ? highlight.tokens
-            : null;
 
-    useEffect(() => {
-        if (tooLarge) return;
-        let cancelled = false;
-        codeToTokensBase(code || ' ', {
-            // The cast is safe: unknown languages throw at runtime and fall
-            // back to the plain <pre> render in the catch below.
-            lang: (LANG_MAP[language] || language) as BundledLanguage | SpecialLanguage,
-            theme: mode === 'dark' ? 'github-dark-default' : 'github-light-default',
-        })
-            .then((result) => {
-                if (!cancelled) {
-                    setHighlight({
-                        code,
-                        language,
-                        mode,
-                        tokens: result as HighlightToken[][],
-                    });
-                }
-            })
-            .catch(() => {
-                if (!cancelled) setHighlight(null);
-            });
-        return () => { cancelled = true; };
-    }, [code, language, mode, tooLarge]);
+    // Tokenizing is synchronous (wasm). Unknown languages and tokenizer
+    // errors fall back to the plain <pre> render below.
+    const tokens = useMemo<HighlightToken[][] | null>(() => {
+        if (tooLarge) return null;
+        const lang = LANG_MAP[language] || language;
+        if (!isSupportedLanguage(lang)) return null;
+        try {
+            return codeToTokens(code || ' ', {
+                lang,
+                theme: highlightThemeFor(palette, mode),
+            }).tokens;
+        } catch {
+            return null;
+        }
+    }, [code, language, mode, palette, tooLarge]);
 
     if (tooLarge || !tokens) {
         return (
