@@ -19,14 +19,11 @@ rand = "0.9"
 base64 = "0.22"
 sha2 = "0.10"
 hmac = "0.12"
-pbkdf2 = { version = "0.12", features = ["simple"] }
-hex = "0.4"
 subtle = "2"
 dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3.32"
-chrono = "0.4.45"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

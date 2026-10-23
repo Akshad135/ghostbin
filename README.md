@@ -57,17 +57,17 @@ _Catppuccin Latte (Light)_
 - [Tokyo Day](public/themes/light-tokyo.png)
 </details>
 
-## Getting Started (Docker)
+## Getting Started (Podman)
 
-You can run ghostbin by pulling the pre-built Docker image or by building it yourself.
+You can run ghostbin by pulling the pre-built image or by building it yourself.
 
 ### Using Pre-built Image
 
 ```bash
-docker run -d \
+podman run -d \
   -p 127.0.0.1:8788:8788 \
   -v ghostbin-data:/app/data \
-  akshad135/ghostbin
+  docker.io/akshad135/ghostbin
 ```
 
 On first visit you choose a passphrase in the browser. It derives both the
@@ -83,10 +83,10 @@ configured via environment variables.
    cd ghostbin
    ```
 
-2. Start the services via Docker Compose:
+2. Start the services via Podman Compose:
 
    ```bash
-   docker-compose up -d
+   podman-compose up -d
    ```
 
 3. Open `http://localhost:8788` in your browser.
@@ -141,7 +141,7 @@ Rate limits: login is throttled per IP (5 failures/minute) and per account (30 f
 
 ### Deployment behind a reverse proxy
 
-Do not publish the app port on all interfaces without TLS. Run the backend bound to localhost (or a private Docker network) and terminate TLS with Caddy/nginx/Traefik:
+Do not publish the app port on all interfaces without TLS. Run the backend bound to localhost (or a private container network) and terminate TLS with Caddy/nginx/Traefik:
 
 - Set `ALLOWED_ORIGINS` to your public origin.
 - Set `TRUSTED_PROXIES` to the proxy's CIDR so rate limiting sees real client IPs.
