@@ -3,7 +3,6 @@ import react from '@vitejs/plugin-react'
 import path from 'path'
 import fs from 'fs'
 import type { ServerResponse } from 'node:http'
-import { manifestPlugin } from './vite-plugin-manifest'
 
 // Custom logger — suppress Vite's built-in red proxy error stack traces
 const logger = createLogger()
@@ -47,11 +46,6 @@ const YAML_TO_ENV: Record<string, string> = {
   app_name_accent: 'VITE_APP_NAME_ACCENT',
   app_description: 'VITE_APP_DESCRIPTION',
   favicon_url: 'VITE_FAVICON_URL',
-  pwa_icon_192: 'VITE_PWA_ICON_192',
-  pwa_icon_512: 'VITE_PWA_ICON_512',
-  pwa_icon_maskable: 'VITE_PWA_ICON_MASKABLE',
-  pwa_icon_svg: 'VITE_PWA_ICON_SVG',
-  pwa_icon_maskable_svg: 'VITE_PWA_ICON_MASKABLE_SVG',
   apple_touch_icon: 'VITE_APPLE_TOUCH_ICON',
 }
 
@@ -70,7 +64,7 @@ export default defineConfig(({ mode }) => {
 
   return {
     customLogger: logger,
-    plugins: [react(), manifestPlugin()],
+    plugins: [react()],
     resolve: {
       alias: {
         '@': path.resolve(__dirname, './src'),

@@ -9,6 +9,8 @@ use tracing_subscriber::{EnvFilter, fmt};
 mod auth;
 mod db;
 mod envelope;
+mod headers;
+mod proxy;
 mod routes;
 mod state;
 
@@ -56,6 +58,54 @@ async fn main() {
     let allowed_origins_raw = std::env::var("ALLOWED_ORIGINS").unwrap_or_default();
     let cors_layer = build_cors_layer(&allowed_origins_raw);
 
+    // TRUSTED_PROXIES (comma-separated CIDRs or IPs) enables client-IP
+    // resolution from X-Forwarded-For for rate limiting behind a reverse
+    // proxy. Without it, the socket peer address is used and the header is
+    // ignored (plan §9).
+    let trusted_proxies =
+        proxy::parse_trusted_proxies(&std::env::var("TRUSTED_PROXIES").unwrap_or_default());
+    if trusted_proxies.is_empty() {
+        tracing::info!(
+            "TRUSTED_PROXIES is not set — X-Forwarded-For is ignored and the \
+             socket peer address is used for rate limiting."
+        );
+    } else {
+        tracing::info!(
+            "Trusting {} proxy CIDR(s) for client-IP resolution",
+            trusted_proxies.len()
+        );
+    }
+
+    // HSTS_ENABLED=1 adds Strict-Transport-Security. Only enable when the
+    // app is served over TLS end-to-end (plan §9).
+    let hsts_enabled = std::env::var("HSTS_ENABLED").map(|v| v == "1").unwrap_or(false);
+    let security_headers = headers::build_security_headers(hsts_enabled);
+    if hsts_enabled {
+        tracing::info!("HSTS enabled (Strict-Transport-Security will be sent)");
+    }
+
+    // BIND_ADDR defaults to all interfaces for container compatibility.
+    // For bare-metal deploys without a TLS proxy in front, bind to
+    // 127.0.0.1 and put a reverse proxy in front instead (plan §9).
+    let bind_raw = std::env::var("BIND_ADDR").unwrap_or_default();
+    let bind_addr: SocketAddr = if bind_raw.trim().is_empty() {
+        let addr = SocketAddr::from(([0, 0, 0, 0], port));
+        tracing::warn!(
+            "BIND_ADDR is not set — listening on {addr}. Put a TLS reverse \
+             proxy in front, or set BIND_ADDR=127.0.0.1 to keep it local."
+        );
+        addr
+    } else {
+        bind_raw
+            .parse()
+            .or_else(|_| format!("{bind_raw}:{port}").parse())
+            .unwrap_or_else(|_| {
+                // Unparseable BIND_ADDR must not silently widen exposure.
+                tracing::error!("Invalid BIND_ADDR {bind_raw:?}; refusing to start.");
+                std::process::exit(1);
+            })
+    };
+
     // ── Database ───────────────────────────────────────────────────────
     if let Some(parent) = Path::new(&db_path).parent() {
         std::fs::create_dir_all(parent).expect("Failed to create database directory");
@@ -80,6 +130,7 @@ async fn main() {
         uploads_dir,
         max_file_size,
         max_text_size,
+        trusted_proxies,
     ));
 
     tracing::info!(
@@ -129,13 +180,16 @@ async fn main() {
         )
         .layer(RequestBodyLimitLayer::new(state.max_file_size))
         .layer(cors_layer)
+        .layer(axum::middleware::from_fn(move |request, next| {
+            let security = security_headers.clone();
+            async move { headers::apply_security_headers(security, request, next).await }
+        }))
         .with_state(state);
 
     // ── Start ──────────────────────────────────────────────────────────
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    tracing::info!("GhostBin server listening on http://{addr}");
+    tracing::info!("GhostBin server listening on http://{bind_addr}");
 
-    let listener = tokio::net::TcpListener::bind(addr)
+    let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
         .expect("Failed to bind");
     axum::serve(

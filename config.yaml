@@ -11,9 +11,4 @@ app_description: A simple, private-first ghostbin with syntax highlighting
 # in public/ and update the paths below.
 
 favicon_url: /favicon.svg
-pwa_icon_192: /icon-192.png
-pwa_icon_512: /icon-512.png
-pwa_icon_maskable: /icon-maskable-512.png
-pwa_icon_svg: /icon.svg
-pwa_icon_maskable_svg: /icon-maskable.svg
 apple_touch_icon: /icon-192.png

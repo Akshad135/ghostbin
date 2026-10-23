@@ -7,20 +7,25 @@ services:
       dockerfile: Dockerfile
     container_name: ghostbin-server
     ports:
-      - "${PORT:-8788}:8788"
+      # Bound to localhost by default. Put a TLS reverse proxy (Caddy,
+      # nginx, Traefik) in front for remote access; do not publish the app
+      # port on all interfaces without TLS.
+      - "127.0.0.1:${PORT:-8788}:8788"
     volumes:
       - ghostbin-data:/app/data
     environment:
-      - AUTH_KEY=${AUTH_KEY:?Set AUTH_KEY in your environment or .env file to a unique secret passphrase (e.g. run: openssl rand -base64 32)}
+      # Lock down CORS to your public origin in production.
+      # Example: ALLOWED_ORIGINS=https://paste.mydomain.com
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}
+      # CIDRs of your reverse proxy so rate limits see real client IPs.
+      # Example: TRUSTED_PROXIES=172.16.0.0/12
+      - TRUSTED_PROXIES=${TRUSTED_PROXIES:-}
+      # Set to 1 when served over TLS end-to-end (adds HSTS).
+      - HSTS_ENABLED=${HSTS_ENABLED:-0}
       # Maximum size (bytes) for a text paste's content. Default: 524288 (512 KB).
       - MAX_TEXT_SIZE=${MAX_TEXT_SIZE:-524288}
       # Maximum size (bytes) for a single file attachment. Default: 52428800 (50 MB).
       - MAX_FILE_SIZE=${MAX_FILE_SIZE:-52428800}
-      # Set to your public URL to restrict CORS to your domain only.
-      # This protects the /unlock endpoint from cross-origin CPU attacks.
-      # Leave unset for local development (defaults to open CORS with a warning).
-      # Example: ALLOWED_ORIGINS=https://paste.mydomain.com
-      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}
       - RUST_LOG=info
     restart: unless-stopped
 

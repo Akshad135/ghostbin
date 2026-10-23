@@ -56,16 +56,13 @@ COPY --from=frontend-builder /app/dist /app/dist
 RUN chmod +x /app/ghostbin-server
 
 # Set environment variables
-ENV HOST=0.0.0.0
+ENV BIND_ADDR=0.0.0.0
 ENV PORT=8788
-ENV DATABASE_URL=sqlite://data/ghostbin.sqlite
+ENV DATABASE_PATH=./data/ghostbin.sqlite
+ENV UPLOADS_DIR=./data/uploads
 ENV RUST_LOG=info
-
-# AUTH_KEY is intentionally NOT set here. It must be provided explicitly at
-# runtime (e.g. `-e AUTH_KEY=...` or via docker-compose/.env) — the server
-# refuses to start without it, or with a known placeholder value, since it
-# both protects login and derives the E2EE encryption key.
-ENV MAX_UPLOAD_SIZE=52428800
+ENV MAX_TEXT_SIZE=524288
+ENV MAX_FILE_SIZE=52428800
 
 EXPOSE 8788
 

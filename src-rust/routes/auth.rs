@@ -16,6 +16,10 @@ use crate::state::{AppState, LoginAttempts};
 
 const MAX_LOGIN_ATTEMPTS: u32 = 5;
 const LOGIN_WINDOW: Duration = Duration::from_secs(60);
+/// Account-wide cap on login failures per window (plan §7.3: "per IP and
+/// per account"). Single-account app, so this is a global counter that
+/// throttles distributed guessing across many IPs.
+const MAX_ACCOUNT_LOGIN_FAILURES: u32 = 30;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -106,16 +110,63 @@ fn record_login_failure(state: &AppState, ip: std::net::IpAddr) {
     let entry = attempts.entry(ip).or_insert_with(|| LoginAttempts {
         count: 0,
         window_start: Instant::now(),
+        locked_until: None,
     });
     if entry.window_start.elapsed() > LOGIN_WINDOW {
         entry.count = 0;
         entry.window_start = Instant::now();
     }
     entry.count += 1;
+    if attempts.len() > 10_000 {
+        attempts.retain(|_, entry| entry.window_start.elapsed() < LOGIN_WINDOW);
+    }
 }
 
 fn clear_login_failures(state: &AppState, ip: std::net::IpAddr) {
     state.login_attempts.lock().unwrap().remove(&ip);
+}
+
+/// Account-wide failure window (plan §7.3 "per account" limit).
+fn account_login_retry_after(state: &AppState) -> Option<u64> {
+    let mut failures = state
+        .account_login_failures
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if failures.window_start.elapsed() > LOGIN_WINDOW {
+        failures.count = 0;
+        failures.window_start = Instant::now();
+    }
+    if failures.count >= MAX_ACCOUNT_LOGIN_FAILURES {
+        Some(
+            LOGIN_WINDOW
+                .saturating_sub(failures.window_start.elapsed())
+                .as_secs()
+                .max(1),
+        )
+    } else {
+        None
+    }
+}
+
+fn record_account_login_failure(state: &AppState) {
+    let mut failures = state
+        .account_login_failures
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if failures.window_start.elapsed() > LOGIN_WINDOW {
+        failures.count = 0;
+        failures.window_start = Instant::now();
+    }
+    failures.count = failures.count.saturating_add(1);
+}
+
+fn clear_account_login_failures(state: &AppState) {
+    let mut failures = state
+        .account_login_failures
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    failures.count = 0;
+    failures.window_start = Instant::now();
 }
 
 fn rate_limited(retry_after: u64) -> Response {
@@ -322,9 +373,12 @@ pub async fn handle_login(
         );
     }
 
-    let ip = addr.ip();
+    let ip = state.client_ip(addr.ip(), &headers);
 
     if let Some(retry_after) = login_retry_after(&state, ip) {
+        return rate_limited(retry_after);
+    }
+    if let Some(retry_after) = account_login_retry_after(&state) {
         return rate_limited(retry_after);
     }
 
@@ -357,6 +411,7 @@ pub async fn handle_login(
 
     if !auth::auth_key_matches(&settings.auth_hash, &auth_key) {
         record_login_failure(&state, ip);
+        record_account_login_failure(&state);
         return api_error(
             StatusCode::UNAUTHORIZED,
             "INVALID_AUTH",
@@ -365,6 +420,7 @@ pub async fn handle_login(
     }
 
     clear_login_failures(&state, ip);
+    clear_account_login_failures(&state);
 
     if let Some(old_token) = auth::session_token_from_headers(&headers)
         && let Err(error) = auth::revoke_session(&state.db, &old_token).await
@@ -714,6 +770,7 @@ mod tests {
             "uploads".to_string(),
             1024,
             1024,
+            Vec::new(),
         ))
     }
 
@@ -841,6 +898,55 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(response.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    #[tokio::test]
+    async fn login_failures_are_rate_limited_per_account() {
+        let state = test_state().await;
+        let response = handle_setup(State(state.clone()), HeaderMap::new(), Json(setup_body())).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let bad_key = auth::encode_base64url(&[9u8; auth::AUTH_KEY_BYTES]);
+        // Spread failures across many IPs so only the account-wide counter
+        // can trip (plan §7.3: per IP and per account).
+        for index in 0..MAX_ACCOUNT_LOGIN_FAILURES {
+            let response = handle_login(
+                State(state.clone()),
+                ConnectInfo(SocketAddr::from((
+                    [127, 0, 0, 1 + (index % 200) as u8],
+                    1234,
+                ))),
+                HeaderMap::new(),
+                Json(LoginBody {
+                    auth_key: bad_key.clone(),
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        // A different, previously clean IP must still be throttled.
+        let response = handle_login(
+            State(state.clone()),
+            ConnectInfo(SocketAddr::from(([127, 0, 0, 2], 1234))),
+            HeaderMap::new(),
+            Json(LoginBody { auth_key: bad_key }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().contains_key(header::RETRY_AFTER));
+
+        // A correct login from a clean IP is throttled too while the
+        // account-wide window is saturated.
+        let good_key = auth::encode_base64url(&[1u8; auth::AUTH_KEY_BYTES]);
+        let response = handle_login(
+            State(state),
+            ConnectInfo(SocketAddr::from(([127, 0, 0, 3], 1234))),
+            HeaderMap::new(),
+            Json(LoginBody { auth_key: good_key }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]

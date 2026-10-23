@@ -9,9 +9,23 @@ createRoot(document.getElementById('root')!).render(
   </StrictMode>,
 )
 
-// Register Service Worker only in production
-if (import.meta.env.PROD && 'serviceWorker' in navigator) {
+// Service-worker kill switch (plan §8.6: no offline support). Older deploys
+// registered a caching worker; unregister every remaining worker and drop
+// its caches so nothing stale — and no decrypted content — survives on disk.
+if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('/sw.js').catch(() => { });
-  });
+    void (async () => {
+      try {
+        const registrations = await navigator.serviceWorker.getRegistrations()
+        await Promise.all(registrations.map((registration) => registration.unregister()))
+        if (typeof caches !== 'undefined') {
+          const cacheKeys = await caches.keys()
+          await Promise.all(cacheKeys.map((key) => caches.delete(key)))
+        }
+      } catch {
+        // The kill switch is best-effort; a failed unregister retries on
+        // the next load.
+      }
+    })()
+  })
 }

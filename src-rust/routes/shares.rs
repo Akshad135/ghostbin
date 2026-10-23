@@ -34,6 +34,12 @@ const CHALLENGE_TTL_SECONDS: i64 = 2 * 60;
 const MAX_ACTIVE_CHALLENGES: i64 = 20;
 const MAX_UNLOCK_ATTEMPTS: u32 = 5;
 const UNLOCK_WINDOW: Duration = Duration::from_secs(60);
+const UNLOCK_BASE_LOCKOUT: Duration = Duration::from_secs(60);
+const UNLOCK_MAX_LOCKOUT: Duration = Duration::from_secs(15 * 60);
+/// Secondary per-IP cap across all share endpoints (plan §7.4): stops one
+/// IP from getting a fresh 5/min budget per share it probes.
+const MAX_SHARE_IP_ATTEMPTS: u32 = 30;
+const SHARE_IP_WINDOW: Duration = Duration::from_secs(60);
 const MAX_SHARE_UNLOCKS: i64 = 1_000_000;
 
 #[derive(Deserialize)]
@@ -257,22 +263,43 @@ async fn retire_share(
     Ok(())
 }
 
+/// Check the per-(client IP, paste) limiter (plan §7.4): 5 attempts per
+/// minute, then an exponential lockout — each further attempt doubles the
+/// remaining lock time, capped at 15 minutes. The lockout always expires;
+/// there is no permanent lock.
 fn unlock_retry_after(state: &AppState, ip: IpAddr, paste_id: &str) -> Option<u64> {
     let mut attempts = state
         .unlock_attempts
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let key = (ip, paste_id.to_string());
-    let Some(entry) = attempts.get(&key) else {
+    let now = Instant::now();
+    let Some(entry) = attempts.get_mut(&key) else {
         return None;
     };
-    let elapsed = entry.window_start.elapsed();
-    if elapsed >= UNLOCK_WINDOW {
-        attempts.remove(&key);
-        return None;
+
+    if let Some(locked_until) = entry.locked_until {
+        if now < locked_until {
+            let remaining = locked_until.saturating_duration_since(now);
+            let extended = (remaining.saturating_mul(2)).min(UNLOCK_MAX_LOCKOUT);
+            entry.locked_until = Some(now + extended);
+            // Round up so sub-second drift never shortens the advertised wait.
+            let secs = extended.as_secs() + u64::from(extended.subsec_nanos() != 0);
+            return Some(secs.max(1));
+        }
+        // Lockout served in full: start a clean window.
+        entry.locked_until = None;
+        entry.count = 0;
+        entry.window_start = now;
+    }
+
+    if entry.window_start.elapsed() >= UNLOCK_WINDOW {
+        entry.count = 0;
+        entry.window_start = now;
     }
     if entry.count >= MAX_UNLOCK_ATTEMPTS {
-        return Some((UNLOCK_WINDOW - elapsed).as_secs().max(1));
+        entry.locked_until = Some(now + UNLOCK_BASE_LOCKOUT);
+        return Some(UNLOCK_BASE_LOCKOUT.as_secs());
     }
     None
 }
@@ -291,6 +318,7 @@ fn record_unlock_attempt(state: &AppState, ip: IpAddr, paste_id: &str) {
         Some(entry) => {
             entry.count = 1;
             entry.window_start = now;
+            entry.locked_until = None;
         }
         None => {
             attempts.insert(
@@ -298,12 +326,20 @@ fn record_unlock_attempt(state: &AppState, ip: IpAddr, paste_id: &str) {
                 LoginAttempts {
                     count: 1,
                     window_start: now,
+                    locked_until: None,
                 },
             );
         }
     }
     if attempts.len() > 10_000 {
-        attempts.retain(|_, entry| entry.window_start.elapsed() < UNLOCK_WINDOW);
+        // Keep entries that are still locked out; an attacker must not be
+        // able to trigger this prune to drop their own lock.
+        attempts.retain(|_, entry| {
+            entry
+                .locked_until
+                .is_some_and(|locked_until| locked_until > now)
+                || entry.window_start.elapsed() < UNLOCK_WINDOW
+        });
     }
 }
 
@@ -313,6 +349,49 @@ fn clear_unlock_failures(state: &AppState, ip: IpAddr, paste_id: &str) {
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     attempts.remove(&(ip, paste_id.to_string()));
+}
+
+/// Secondary per-IP control across all share endpoints (plan §7.4): a
+/// fixed window over challenge and unlock attempts regardless of paste.
+fn share_ip_retry_after(state: &AppState, ip: IpAddr) -> Option<u64> {
+    let mut attempts = state
+        .share_ip_attempts
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let now = Instant::now();
+    let Some(entry) = attempts.get_mut(&ip) else {
+        return None;
+    };
+    if entry.window_start.elapsed() >= SHARE_IP_WINDOW {
+        entry.count = 0;
+        entry.window_start = now;
+    }
+    if entry.count >= MAX_SHARE_IP_ATTEMPTS {
+        Some((SHARE_IP_WINDOW - entry.window_start.elapsed()).as_secs().max(1))
+    } else {
+        None
+    }
+}
+
+fn record_share_ip_attempt(state: &AppState, ip: IpAddr) {
+    let mut attempts = state
+        .share_ip_attempts
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let now = Instant::now();
+    let entry = attempts.entry(ip).or_insert(LoginAttempts {
+        count: 0,
+        window_start: now,
+        locked_until: None,
+    });
+    if entry.window_start.elapsed() >= SHARE_IP_WINDOW {
+        entry.count = 0;
+        entry.window_start = now;
+    }
+    entry.count = entry.count.saturating_add(1);
+    if attempts.len() > 10_000 {
+        attempts.retain(|_, entry| entry.window_start.elapsed() < SHARE_IP_WINDOW);
+    }
 }
 
 fn verify_proof(share_auth_key: &[u8], nonce: &str, paste_id: &str, proof: &[u8]) -> bool {
@@ -634,7 +713,11 @@ pub async fn handle_challenge(
     if !is_paste_id(&paste_id) {
         return invalid("Invalid paste ID");
     }
-    if let Some(retry_after) = unlock_retry_after(&state, addr.ip(), &paste_id) {
+    let ip = state.client_ip(addr.ip(), &headers);
+    if let Some(retry_after) = share_ip_retry_after(&state, ip) {
+        return rate_limited(retry_after);
+    }
+    if let Some(retry_after) = unlock_retry_after(&state, ip, &paste_id) {
         return rate_limited(retry_after);
     }
     match burn_if_due(&state, &paste_id).await {
@@ -722,7 +805,8 @@ pub async fn handle_challenge(
         return api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", "Database error");
     }
 
-    record_unlock_attempt(&state, addr.ip(), &paste_id);
+    record_unlock_attempt(&state, ip, &paste_id);
+    record_share_ip_attempt(&state, ip);
 
     (
         no_store_headers(),
@@ -749,7 +833,11 @@ pub async fn handle_unlock(
     if !is_paste_id(&paste_id) {
         return invalid("Invalid paste ID");
     }
-    if let Some(retry_after) = unlock_retry_after(&state, addr.ip(), &paste_id) {
+    let ip = state.client_ip(addr.ip(), &headers);
+    if let Some(retry_after) = share_ip_retry_after(&state, ip) {
+        return rate_limited(retry_after);
+    }
+    if let Some(retry_after) = unlock_retry_after(&state, ip, &paste_id) {
         return rate_limited(retry_after);
     }
     let nonce = match envelope::decode_b64_exact(&body.nonce, CHALLENGE_NONCE_BYTES) {
@@ -760,7 +848,7 @@ pub async fn handle_unlock(
         Some(value) => value,
         None => return invalid("Invalid unlock proof"),
     };
-    if let Err(response) = verify_and_unlock(&state, &paste_id, &nonce, &proof, addr.ip()).await {
+    if let Err(response) = verify_and_unlock(&state, &paste_id, &nonce, &proof, ip).await {
         return response;
     }
     match unlock_response(&state, &paste_id).await {
@@ -860,6 +948,7 @@ async fn verify_and_unlock(
 
     if !verify_proof(&row.share_auth_key, nonce, paste_id, proof) {
         record_unlock_attempt(state, ip, paste_id);
+        record_share_ip_attempt(state, ip);
         return Err(api_error(
             StatusCode::UNAUTHORIZED,
             "INVALID_PROOF",
@@ -1412,5 +1501,80 @@ mod tests {
         let mut limited = row.clone();
         limited.unlocks_used = 2;
         assert!(!share_is_usable(&limited, 100));
+    }
+
+    async fn limiter_state() -> AppState {
+        let pool = test_pool().await;
+        AppState::new(
+            pool,
+            String::new(),
+            String::new(),
+            0,
+            0,
+            Vec::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn unlock_limiter_locks_exponentially_and_caps_at_15_minutes() {
+        let state = limiter_state().await;
+        let ip: IpAddr = "203.0.113.4".parse().unwrap();
+
+        // Four recorded failures stay under the limit; the fifth uses it up.
+        for _ in 0..MAX_UNLOCK_ATTEMPTS - 1 {
+            record_unlock_attempt(&state, ip, "paste");
+        }
+        assert!(unlock_retry_after(&state, ip, "paste").is_none());
+        record_unlock_attempt(&state, ip, "paste");
+
+        // The next check trips the base one-minute lockout.
+        assert_eq!(unlock_retry_after(&state, ip, "paste"), Some(60));
+
+        // Each blocked attempt doubles the remaining lockout…
+        assert_eq!(unlock_retry_after(&state, ip, "paste"), Some(120));
+        assert_eq!(unlock_retry_after(&state, ip, "paste"), Some(240));
+        assert_eq!(unlock_retry_after(&state, ip, "paste"), Some(480));
+        // …capped at 15 minutes.
+        assert_eq!(unlock_retry_after(&state, ip, "paste"), Some(900));
+        assert_eq!(unlock_retry_after(&state, ip, "paste"), Some(900));
+
+        // Success clears the bucket entirely.
+        clear_unlock_failures(&state, ip, "paste");
+        assert!(unlock_retry_after(&state, ip, "paste").is_none());
+    }
+
+    #[tokio::test]
+    async fn unlock_limiter_entries_are_isolated_per_paste() {
+        let state = limiter_state().await;
+        let ip: IpAddr = "203.0.113.4".parse().unwrap();
+
+        for _ in 0..MAX_UNLOCK_ATTEMPTS {
+            record_unlock_attempt(&state, ip, "paste-a");
+        }
+        assert_eq!(unlock_retry_after(&state, ip, "paste-a"), Some(60));
+        // A different paste for the same IP is unaffected.
+        assert!(unlock_retry_after(&state, ip, "paste-b").is_none());
+    }
+
+    #[tokio::test]
+    async fn share_ip_limiter_caps_one_ip_across_many_pastes() {
+        let state = limiter_state().await;
+        let ip: IpAddr = "203.0.113.4".parse().unwrap();
+
+        // Rotate paste IDs so every per-paste bucket stays fresh; only the
+        // aggregate per-IP counter (plan §7.4 secondary control) can trip.
+        for index in 0..MAX_SHARE_IP_ATTEMPTS {
+            record_unlock_attempt(&state, ip, &format!("paste-{index}"));
+            record_share_ip_attempt(&state, ip);
+            assert!(
+                unlock_retry_after(&state, ip, &format!("paste-{index}")).is_none(),
+                "per-paste bucket must stay fresh while rotating paste IDs"
+            );
+        }
+
+        // The next attempt from this IP — even against a brand-new paste —
+        // is blocked by the aggregate cap.
+        assert!(share_ip_retry_after(&state, ip).is_some());
+        assert!(unlock_retry_after(&state, ip, "paste-fresh").is_none());
     }
 }

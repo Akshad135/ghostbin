@@ -9,10 +9,9 @@
 - File attachments with configurable size limits
 - End-to-End Encryption (E2EE) derived from your auth passphrase
 - Single-user authentication (no accounts needed)
-- PWA support for mobile and desktop installation
+- Burn-after-read and view-counted encrypted sharing
 - Pin important pastes to the top
-- 8 Character Code based sharing
-- Zero tracking (no analytics, no tracking cookies)
+- Zero tracking (no analytics, no tracking cookies, self-hosted fonts)
 
 ## Screenshots
 
@@ -66,11 +65,14 @@ You can run ghostbin by pulling the pre-built Docker image or by building it you
 
 ```bash
 docker run -d \
-  -p 8788:8788 \
+  -p 127.0.0.1:8788:8788 \
   -v ghostbin-data:/app/data \
-  -e AUTH_KEY="your_secure_passphrase" \
   akshad135/ghostbin
 ```
+
+On first visit you choose a passphrase in the browser. It derives both the
+login key and the E2EE vault key — the server never sees it, so it is not
+configured via environment variables.
 
 ### Build from Source
 
@@ -84,13 +86,12 @@ docker run -d \
 2. Start the services via Docker Compose:
 
    ```bash
-   # Make sure to set a secure AUTH_KEY. This protects login and derives the encryption key.
-   AUTH_KEY="your_secure_passphrase" docker-compose up -d
+   docker-compose up -d
    ```
 
 3. Open `http://localhost:8788` in your browser.
 
-> **Note:** You can also define `AUTH_KEY`, `MAX_TEXT_SIZE`, and `MAX_FILE_SIZE` in an `.env` file in the root directory.
+> **Note:** `MAX_TEXT_SIZE`, `MAX_FILE_SIZE`, `ALLOWED_ORIGINS`, `TRUSTED_PROXIES`, and `HSTS_ENABLED` can be defined in an `.env` file in the root directory (see [.env.example](.env.example)).
 
 ## Local Build
 
@@ -108,8 +109,7 @@ If you want to run the project natively you will need **Node.js** and **Rust**.
 npm install
 
 # 2. Start the Rust backend (runs on :8788 by default)
-# Make sure to set the AUTH_KEY environment variable.
-AUTH_KEY="your_secure_passphrase" npm run dev:backend
+npm run dev:backend
 
 # 3. Start the Vite frontend in a new terminal
 npm run dev
@@ -121,12 +121,40 @@ Visit `http://localhost:5173` to see the frontend. API requests are automaticall
 
 Branding is configured in [`config.yaml`](config.yaml) (committed to the repo). Edit it to customize your instance (app name, description, icons, etc).
 
-For backend limits, you can adjust environment variables:
+Backend environment variables (see [.env.example](.env.example) for the full list):
 
 - `MAX_TEXT_SIZE`: Max size in bytes for a text paste (Default: 512 KB).
 - `MAX_FILE_SIZE`: Max size in bytes for a single file attachment (Default: 50 MB).
+- `ALLOWED_ORIGINS`: Your public origin, e.g. `https://paste.mydomain.com`. Locks down CORS; leave unset only for local dev.
+- `TRUSTED_PROXIES`: Comma-separated IPs/CIDRs of your reverse proxy. When set, rate limits use the real client IP from `X-Forwarded-For`; otherwise the header is ignored.
+- `HSTS_ENABLED`: Set to `1` when the app is served over TLS end-to-end to add `Strict-Transport-Security`.
+- `BIND_ADDR`: Listen address (Default: `0.0.0.0`). Use `127.0.0.1` for bare-metal deploys behind a local proxy.
+- `RESET_DB`: Set to `1` once to wipe an old-model database and recreate the current schema. Destroys all data — back up first.
 
 > **Icons**: Drop your own images into `public/` and update `config.yaml`. The bundled ghost icon is used by default and adapts its color to the active theme.
+
+## Security
+
+The server sends `Content-Security-Policy` (self-only sources, `wasm-unsafe-eval` for the Argon2id KDF), `Referrer-Policy: no-referrer`, `X-Content-Type-Options: nosniff`, `Permissions-Policy`, and `X-Frame-Options: DENY` on every response. API, paste, share, and file responses are `Cache-Control: no-store`.
+
+Rate limits: login is throttled per IP (5 failures/minute) and per account (30 failures/minute across all IPs). Share unlock attempts are limited to 5 per minute per IP and paste, with an exponential lockout that doubles on repeated attempts and caps at 15 minutes. All limits return `429` with `Retry-After`.
+
+### Deployment behind a reverse proxy
+
+Do not publish the app port on all interfaces without TLS. Run the backend bound to localhost (or a private Docker network) and terminate TLS with Caddy/nginx/Traefik:
+
+- Set `ALLOWED_ORIGINS` to your public origin.
+- Set `TRUSTED_PROXIES` to the proxy's CIDR so rate limiting sees real client IPs.
+- Set `HSTS_ENABLED=1` once HTTPS works end-to-end.
+- Pass `X-Forwarded-For` from the proxy (nginx: `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`).
+
+### Backups
+
+Use `scripts/backup.sh` — it snapshots the database with `VACUUM INTO` (safe while the server runs; never copy the live SQLite file, its WAL sidecars make a plain copy corruptible) and archives the uploads directory:
+
+```bash
+scripts/backup.sh ./data ./backups
+```
 
 ## License
 

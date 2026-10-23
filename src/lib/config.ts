@@ -15,11 +15,6 @@ export const config = {
 
     // Icons — fall back to bundled static assets
     faviconUrl: import.meta.env.VITE_FAVICON_URL || '/favicon.svg',
-    pwaIcon192: import.meta.env.VITE_PWA_ICON_192 || '/icon-192.png',
-    pwaIcon512: import.meta.env.VITE_PWA_ICON_512 || '/icon-512.png',
-    pwaIconMaskable: import.meta.env.VITE_PWA_ICON_MASKABLE || '/icon-maskable-512.png',
-    pwaIconSvg: import.meta.env.VITE_PWA_ICON_SVG || '/icon.svg',
-    pwaIconMaskableSvg: import.meta.env.VITE_PWA_ICON_MASKABLE_SVG || '/icon-maskable.svg',
     appleTouchIcon: import.meta.env.VITE_APPLE_TOUCH_ICON || '/icon-192.png',
     // Maximum plaintext paste size in bytes. Must not exceed the server's
     // MAX_TEXT_SIZE. Default: 524288 (512 KB).
