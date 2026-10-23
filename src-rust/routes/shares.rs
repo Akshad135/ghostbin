@@ -47,6 +47,10 @@ const MAX_SHARE_UNLOCKS: i64 = 1_000_000;
 pub struct CreateShareBody {
     share_salt: String,
     share_auth_key: String,
+    /// KDF params the creator derived the share keys with. Pinned per share
+    /// so guests always derive with the params the share was created with,
+    /// even if the client or server default changes later.
+    kdf_params: KdfParams,
     wrapped_paste_key: String,
     expires_at: Option<i64>,
     max_unlocks: Option<i64>,
@@ -71,8 +75,8 @@ struct ShareRow {
     paste_id: String,
     share_salt: Vec<u8>,
     share_auth_key: Vec<u8>,
+    kdf_params: String,
     expires_at: Option<i64>,
-    revoked_at: Option<i64>,
     unlocks_used: i64,
     max_unlocks: Option<i64>,
     created_at: i64,
@@ -207,15 +211,14 @@ fn rate_limited(retry_after: u64) -> Response {
 }
 
 fn share_is_usable(row: &ShareRow, now: i64) -> bool {
-    row.revoked_at.is_none()
-        && row.expires_at.is_none_or(|expires_at| expires_at > now)
+    row.expires_at.is_none_or(|expires_at| expires_at > now)
         && row.max_unlocks.is_none_or(|max| row.unlocks_used < max)
 }
 
 async fn load_share(state: &AppState, paste_id: &str) -> Result<Option<ShareRow>, sqlx::Error> {
     sqlx::query_as::<_, ShareRow>(
         "SELECT s.paste_id, s.share_salt, s.share_auth_key,
-                s.expires_at, s.revoked_at, s.unlocks_used, s.max_unlocks, s.created_at,
+                s.kdf_params, s.expires_at, s.unlocks_used, s.max_unlocks, s.created_at,
                 p.burn_mode, p.burn_at
          FROM shares s JOIN pastes p ON p.id = s.paste_id
          WHERE s.paste_id = ?",
@@ -255,7 +258,7 @@ async fn retire_share(
     row: &ShareRow,
     now: i64,
 ) -> Result<(), sqlx::Error> {
-    if row.revoked_at.is_some() || row.expires_at.is_some_and(|expires_at| expires_at <= now) {
+    if row.expires_at.is_some_and(|expires_at| expires_at <= now) {
         let _ = delete_share(state, &row.paste_id).await?;
     } else if row.max_unlocks.is_some_and(|max| row.unlocks_used >= max) {
         apply_unlock_limit(state, row).await?;
@@ -443,6 +446,16 @@ pub async fn handle_create(
             Some(value) => value,
             None => return invalid("Invalid wrapped paste key"),
         };
+    if let Err(message) = body.kdf_params.validate() {
+        return invalid(message);
+    }
+    let kdf_params = match serde_json::to_string(&body.kdf_params) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!("Failed to serialize share KDF params: {error}");
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", "Database error");
+        }
+    };
     let now = auth::now_unix();
     if let Some(expires_at) = body.expires_at {
         if expires_at <= now {
@@ -515,13 +528,14 @@ pub async fn handle_create(
 
     let result = sqlx::query(
         "INSERT INTO shares
-            (paste_id, share_salt, share_auth_key, wrapped_paste_key,
-             expires_at, revoked_at, unlocks_used, max_unlocks, created_at)
-         VALUES (?, ?, ?, ?, ?, NULL, 0, ?, ?)",
+            (paste_id, share_salt, share_auth_key, kdf_params, wrapped_paste_key,
+             expires_at, unlocks_used, max_unlocks, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
     )
     .bind(&paste_id)
     .bind(&share_salt)
     .bind(&share_auth_key)
+    .bind(&kdf_params)
     .bind(&wrapped_paste_key)
     .bind(body.expires_at)
     .bind(max_unlocks)
@@ -683,11 +697,25 @@ pub async fn handle_params(
         return api_error(StatusCode::GONE, "SHARE_INVALID", "This share is no longer available");
     }
 
+    // Return the params this share was created with, not the server default,
+    // so guests derive the same keys even if defaults drift later.
+    let kdf_params = match serde_json::from_str::<KdfParams>(&row.kdf_params) {
+        Ok(params) => params,
+        Err(error) => {
+            tracing::error!("Stored share KDF params are invalid: {error}");
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                "Stored share KDF parameters are invalid",
+            );
+        }
+    };
+
     (
         no_store_headers(),
         Json(json!({
             "shareSalt": envelope::encode_b64(&row.share_salt),
-            "kdfParams": KdfParams::default(),
+            "kdfParams": kdf_params,
             "expiresAt": row.expires_at,
             "unlocksUsed": row.unlocks_used,
             "maxUnlocks": row.max_unlocks,
@@ -1035,7 +1063,6 @@ struct ViewTokenRow {
     paste_id: String,
     token_expires_at: i64,
     share_expires_at: Option<i64>,
-    revoked_at: Option<i64>,
     unlocks_used: i64,
     max_unlocks: Option<i64>,
     burn_mode: Option<String>,
@@ -1097,7 +1124,7 @@ async fn view_transaction(
 ) -> Result<ViewOutcome, sqlx::Error> {
     let row = sqlx::query_as::<_, ViewTokenRow>(
         "SELECT t.share_id AS paste_id, t.expires_at AS token_expires_at,
-                s.expires_at AS share_expires_at, s.revoked_at, s.unlocks_used,
+                s.expires_at AS share_expires_at, s.unlocks_used,
                 s.max_unlocks, p.burn_mode, p.burn_at
          FROM share_tokens t
          JOIN shares s ON s.paste_id = t.share_id
@@ -1123,10 +1150,9 @@ async fn view_transaction(
         let disk_names = delete_paste_in_tx(&mut **connection, &row.paste_id).await?;
         return Ok(ViewOutcome::Gone { disk_names });
     }
-    if row.revoked_at.is_some()
-        || row
-            .share_expires_at
-            .is_some_and(|expires_at| expires_at <= now)
+    if row
+        .share_expires_at
+        .is_some_and(|expires_at| expires_at <= now)
     {
         delete_share_in_tx(&mut **connection, &row.paste_id).await?;
         return Ok(ViewOutcome::Gone { disk_names: vec![] });
@@ -1183,6 +1209,7 @@ async fn view_transaction(
 /// POST /api/shares/:id/view
 pub async fn handle_view(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(paste_id): Path<String>,
     Json(body): Json<ViewBody>,
@@ -1197,6 +1224,13 @@ pub async fn handle_view(
     if !is_paste_id(&paste_id) {
         return invalid("Invalid paste ID");
     }
+    // This endpoint takes the SQLite write lock before validating the token;
+    // the per-IP share limiter keeps an unauthenticated flood from pinning
+    // that lock and starving every legitimate write.
+    let ip = state.client_ip(addr.ip(), &headers);
+    if let Some(retry_after) = share_ip_retry_after(&state, ip) {
+        return rate_limited(retry_after);
+    }
     if envelope::decode_b64_exact(&body.share_token, SHARE_TOKEN_BYTES).is_none() {
         return api_error(StatusCode::UNAUTHORIZED, "INVALID_TOKEN", "Invalid share token");
     }
@@ -1210,6 +1244,8 @@ pub async fn handle_view(
             return api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", "Database error");
         }
     }
+
+    record_share_ip_attempt(&state, ip);
 
     let mut transaction = match state.db.begin_with("BEGIN IMMEDIATE").await {
         Ok(transaction) => transaction,
@@ -1323,8 +1359,8 @@ pub async fn token_allows_paste(
     }
     let token_hash = auth::hash_token(token);
     let now = auth::now_unix();
-    let row: Option<(Option<i64>, Option<i64>, Option<i64>, i64, i64)> = sqlx::query_as(
-        "SELECT s.expires_at, s.revoked_at, s.max_unlocks, s.unlocks_used, t.expires_at
+    let row: Option<(Option<i64>, Option<i64>, i64, i64)> = sqlx::query_as(
+        "SELECT s.expires_at, s.max_unlocks, s.unlocks_used, t.expires_at
          FROM share_tokens t
          JOIN shares s ON s.paste_id = t.share_id
          WHERE t.token_hash = ? AND s.paste_id = ?",
@@ -1333,13 +1369,11 @@ pub async fn token_allows_paste(
     .bind(paste_id)
     .fetch_optional(&state.db)
     .await?;
-    let Some((share_expires_at, revoked_at, max_unlocks, unlocks_used, token_expires_at)) = row
-    else {
+    let Some((share_expires_at, max_unlocks, unlocks_used, token_expires_at)) = row else {
         return Ok(false);
     };
     Ok(token_expires_at > now
         && share_expires_at.is_none_or(|expires_at| expires_at > now)
-        && revoked_at.is_none()
         && max_unlocks.is_none_or(|max| unlocks_used < max))
 }
 
@@ -1376,7 +1410,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        crate::db::init_schema(&pool, false).await.unwrap();
+        crate::db::init_schema(&pool, crate::db::ResetDb::No).await.unwrap();
         pool
     }
 
@@ -1397,9 +1431,9 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO shares
-                (paste_id, share_salt, share_auth_key, wrapped_paste_key,
-                 expires_at, revoked_at, unlocks_used, max_unlocks, created_at)
-             VALUES (?, ?, ?, ?, NULL, NULL, 0, ?, 0)",
+                (paste_id, share_salt, share_auth_key, kdf_params, wrapped_paste_key,
+                 expires_at, unlocks_used, max_unlocks, created_at)
+             VALUES (?, ?, ?, '{}', ?, NULL, 0, ?, 0)",
         )
         .bind(paste_id)
         .bind(vec![1u8; 16])
@@ -1488,8 +1522,8 @@ mod tests {
             paste_id: "p".into(),
             share_salt: vec![],
             share_auth_key: vec![],
+            kdf_params: "{}".into(),
             expires_at: Some(200),
-            revoked_at: None,
             unlocks_used: 1,
             max_unlocks: Some(2),
             created_at: 1,
@@ -1512,6 +1546,7 @@ mod tests {
             0,
             0,
             Vec::new(),
+            None,
         )
     }
 

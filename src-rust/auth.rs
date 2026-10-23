@@ -314,7 +314,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .expect("in-memory SQLite");
-        crate::db::init_schema(&pool, false)
+        crate::db::init_schema(&pool, crate::db::ResetDb::No)
             .await
             .expect("schema init");
         pool

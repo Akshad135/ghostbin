@@ -77,6 +77,7 @@ export function Navbar() {
         setup,
         changePassphrase,
         configured,
+        setupTokenRequired,
         isLoading,
     } = useAuth();
 
@@ -86,6 +87,7 @@ export function Navbar() {
     const [isThemeOpen, setIsThemeOpen] = useState(false);
     const [passphrase, setPassphrase] = useState('');
     const [confirmPassphrase, setConfirmPassphrase] = useState('');
+    const [setupToken, setSetupToken] = useState('');
     const [loginError, setLoginError] = useState('');
     const [loginLoading, setLoginLoading] = useState(false);
     const [rememberDevice, setRememberDevice] = useState(false);
@@ -131,11 +133,15 @@ export function Navbar() {
             setLoginError('Use at least 8 characters');
             return;
         }
+        if (isSetup && setupTokenRequired && !setupToken.trim()) {
+            setLoginError('This server requires a setup token to claim it');
+            return;
+        }
         setLoginLoading(true);
         setLoginError('');
         try {
             if (isSetup) {
-                await setup(passphrase, rememberDevice);
+                await setup(passphrase, rememberDevice, setupToken.trim() || undefined);
                 toast.success('Vault created');
             } else {
                 await login(passphrase, rememberDevice);
@@ -143,6 +149,7 @@ export function Navbar() {
             }
             setPassphrase('');
             setConfirmPassphrase('');
+            setSetupToken('');
             setIsLoginOpen(false);
         } catch (err) {
             setLoginError(err instanceof Error ? err.message : 'Invalid passphrase');
@@ -369,6 +376,7 @@ export function Navbar() {
                     if (!open) {
                         setPassphrase('');
                         setConfirmPassphrase('');
+                        setSetupToken('');
                         setLoginError('');
                     }
                 }}
@@ -385,6 +393,16 @@ export function Navbar() {
                                 Choose a strong passphrase. It derives the only key that can
                                 decrypt your content. There is no reset or recovery.
                             </p>
+                        )}
+                        {isSetup && setupTokenRequired && (
+                            <Input
+                                type="password"
+                                placeholder="Setup token"
+                                value={setupToken}
+                                onChange={(e) => setSetupToken(e.target.value)}
+                                className="h-9"
+                                autoComplete="off"
+                            />
                         )}
                         <Input
                             type="password"

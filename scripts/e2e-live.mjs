@@ -320,6 +320,7 @@ async function main() {
     {
       shareSalt: bytesToBase64Url(shareSalt),
       shareAuthKey: bytesToBase64Url(shareKeys.authKey),
+      kdfParams: { ...DEFAULT_ARGON2_PARAMS },
       wrappedPasteKey,
     },
     csrfHeadersNow(),
@@ -498,6 +499,7 @@ async function main() {
     {
       shareSalt: bytesToBase64Url(burnShareSalt),
       shareAuthKey: bytesToBase64Url(burnKeys.authKey),
+      kdfParams: { ...DEFAULT_ARGON2_PARAMS },
       wrappedPasteKey: await wrapPasteKeyForShare(
         burnKeys.wrapKey,
         burnKeyBytes,

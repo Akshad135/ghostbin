@@ -21,10 +21,14 @@ const SHARE_WRAP_INFO = "ghostbin/share-wrap/v1|";
 const KEY_BYTES = 32;
 const AES_KEY_BITS = 256;
 
+export type ShareCodeErrorReason = "length" | "alphabet";
+
 export class ShareCodeError extends Error {
-  constructor(message: string) {
+  readonly reason: ShareCodeErrorReason;
+  constructor(message: string, reason: ShareCodeErrorReason) {
     super(message);
     this.name = "ShareCodeError";
+    this.reason = reason;
   }
 }
 
@@ -40,11 +44,11 @@ export function generateShareCode(): string {
 export function normalizeShareCode(input: string): string {
   const normalized = input.toUpperCase().replace(/[\s-]+/g, "");
   if (normalized.length !== SHARE_CODE_LENGTH) {
-    throw new ShareCodeError("Share code must be 14 characters");
+    throw new ShareCodeError("Share code must be 14 characters", "length");
   }
   for (const char of normalized) {
     if (!SHARE_CODE_ALPHABET.includes(char)) {
-      throw new ShareCodeError("Share code contains an invalid character");
+      throw new ShareCodeError("Share code contains an invalid character", "alphabet");
     }
   }
   return normalized;

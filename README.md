@@ -129,7 +129,8 @@ Backend environment variables (see [.env.example](.env.example) for the full lis
 - `TRUSTED_PROXIES`: Comma-separated IPs/CIDRs of your reverse proxy. When set, rate limits use the real client IP from `X-Forwarded-For`; otherwise the header is ignored.
 - `HSTS_ENABLED`: Set to `1` when the app is served over TLS end-to-end to add `Strict-Transport-Security`.
 - `BIND_ADDR`: Listen address (Default: `0.0.0.0`). Use `127.0.0.1` for bare-metal deploys behind a local proxy.
-- `RESET_DB`: Set to `1` once to wipe an old-model database and recreate the current schema. Destroys all data — back up first.
+- `RESET_DB`: `1` wipes only an incompatible (old-model) database; `force` wipes even the current schema (e.g. to reclaim an instance whose setup was squatted). Destroys all data — back up first.
+- `SETUP_TOKEN`: Optional shared secret required to claim a fresh instance via the setup dialog. Set it before exposing the server publicly so a scanner cannot squat the one-time setup.
 
 > **Icons**: Drop your own images into `public/` and update `config.yaml`. The bundled ghost icon is used by default and adapts its color to the active theme.
 

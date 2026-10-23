@@ -1,4 +1,4 @@
--- GhostBin E2EE schema, version 2.
+-- GhostBin E2EE schema, version 3.
 -- The server never stores plaintext paste content, passphrases, or raw auth keys.
 
 CREATE TABLE settings (
@@ -37,9 +37,11 @@ CREATE TABLE shares (
     paste_id TEXT PRIMARY KEY REFERENCES pastes(id) ON DELETE CASCADE,
     share_salt BLOB NOT NULL,
     share_auth_key BLOB NOT NULL,
+    -- KDF params the share was created with; guests derive keys with these,
+    -- so they are pinned per share instead of following the server default.
+    kdf_params TEXT NOT NULL,
     wrapped_paste_key BLOB NOT NULL,
     expires_at INTEGER,
-    revoked_at INTEGER,
     unlocks_used INTEGER NOT NULL DEFAULT 0 CHECK (unlocks_used >= 0),
     max_unlocks INTEGER CHECK (max_unlocks IS NULL OR max_unlocks > 0),
     created_at INTEGER NOT NULL

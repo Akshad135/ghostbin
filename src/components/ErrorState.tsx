@@ -5,9 +5,13 @@ import { HourglassIcon } from '@/components/ui/animated-hourglass';
 import { ArrowLeftIcon } from '@/components/ui/animated-arrow-left';
 import { cn } from '@/lib/utils';
 
-export function ErrorState({ type = 'not-found', error = '' }: { type?: 'not-found' | 'expired', error?: string }) {
+export function ErrorState({ type = 'not-found', error = '' }: { type?: 'not-found' | 'expired' | 'error', error?: string }) {
     const navigate = useNavigate();
     const expired = type === 'expired';
+    const title = expired ? 'Paste expired' : type === 'error' ? 'Cannot open this paste' : 'Paste not found';
+    const message = expired
+        ? 'This paste has expired and is no longer available.'
+        : error || (type === 'error' ? 'An unexpected error occurred.' : 'Paste not found');
 
     return (
         <div className="w-full h-full flex flex-col items-center justify-center p-6">
@@ -19,12 +23,8 @@ export function ErrorState({ type = 'not-found', error = '' }: { type?: 'not-fou
                         <BadgeAlertIcon size={32} className="text-destructive" />
                     )}
                 </div>
-                <h2 className="text-lg font-semibold">{expired ? 'Paste expired' : 'Paste not found'}</h2>
-                <p className="text-sm text-muted-foreground mt-1">
-                    {expired 
-                        ? 'This paste has expired and is no longer available.' 
-                        : (error || 'Paste not found')}
-                </p>
+                <h2 className="text-lg font-semibold">{title}</h2>
+                <p className="text-sm text-muted-foreground mt-1">{message}</p>
                 <Button variant="outline" className="mt-4" onClick={() => navigate('/')}>
                     <ArrowLeftIcon size={16} className="mr-1.5" />
                     Back to Home

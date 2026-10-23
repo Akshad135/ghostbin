@@ -48,10 +48,17 @@ test("code normalization accepts lowercase, spaces, and hyphens", () => {
   assert.equal(isShareCode(messy), true);
 });
 
-test("invalid codes are rejected", () => {
+test("invalid codes are rejected with a distinct reason", () => {
   assert.throws(() => normalizeShareCode("ABC"), ShareCodeError);
-  assert.throws(() => normalizeShareCode("O".repeat(14)), ShareCodeError);
   assert.throws(() => normalizeShareCode("A".repeat(13)), ShareCodeError);
+  assert.throws(
+    () => normalizeShareCode("A".repeat(13)),
+    (error: ShareCodeError) => error.reason === "length",
+  );
+  assert.throws(
+    () => normalizeShareCode("O".repeat(14)),
+    (error: ShareCodeError) => error.reason === "alphabet",
+  );
   assert.equal(isShareCode("not a code"), false);
 });
 

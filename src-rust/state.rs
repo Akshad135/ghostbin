@@ -41,6 +41,10 @@ pub struct AppState {
     /// Trusted proxy CIDRs from `TRUSTED_PROXIES`; empty means the socket
     /// peer address is always used as the client IP.
     pub trusted_proxies: Vec<Cidr>,
+    /// Optional shared secret required to claim a fresh instance via
+    /// `/api/auth/setup` (`SETUP_TOKEN`). Prevents setup squatting in the
+    /// window between deploy and first-run setup on a public instance.
+    pub setup_token: Option<String>,
 }
 
 impl AppState {
@@ -51,6 +55,7 @@ impl AppState {
         max_file_size: usize,
         max_text_size: usize,
         trusted_proxies: Vec<Cidr>,
+        setup_token: Option<String>,
     ) -> Self {
         // Create a broadcast channel with a capacity of 100 messages
         let (ws_sender, _) = broadcast::channel(100);
@@ -70,6 +75,7 @@ impl AppState {
                 locked_until: None,
             }),
             trusted_proxies,
+            setup_token,
         }
     }
 

@@ -107,7 +107,16 @@ pub async fn handle_upload(
     if !is_file_id(&query.file_id) {
         return api_error(StatusCode::BAD_REQUEST, "INVALID_REQUEST", "Invalid file ID");
     }
-    if query.size < 0 || query.size as usize > state.max_file_size {
+    // Encrypted attachments are never empty (envelope + GCM overhead), so a
+    // zero-size body is always invalid.
+    if query.size <= 0 {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "INVALID_REQUEST",
+            "File must not be empty",
+        );
+    }
+    if query.size as usize > state.max_file_size {
         return api_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "FILE_TOO_LARGE",
@@ -156,6 +165,9 @@ pub async fn handle_upload(
         return api_error(StatusCode::NOT_FOUND, "PASTE_NOT_FOUND", "Paste not found");
     }
 
+    // Fast-fail quota check before streaming the body; the authoritative
+    // check runs inside the insert transaction below so concurrent uploads
+    // cannot both pass it and overshoot the quota.
     let used: i64 = match sqlx::query_scalar(
         "SELECT COALESCE(SUM(size), 0) FROM files WHERE paste_id = ?",
     )
@@ -248,6 +260,40 @@ pub async fn handle_upload(
     }
 
     let now = auth::now_unix();
+    let mut transaction = match state.db.begin_with("BEGIN IMMEDIATE").await {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            tracing::error!("Failed to begin file insert: {error}");
+            remove_quiet(&final_path).await;
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", "Database error");
+        }
+    };
+
+    let used: i64 = match sqlx::query_scalar(
+        "SELECT COALESCE(SUM(size), 0) FROM files WHERE paste_id = ?",
+    )
+    .bind(&query.paste_id)
+    .fetch_one(&mut *transaction)
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            tracing::error!("Failed to sum paste files: {error}");
+            remove_quiet(&final_path).await;
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", "Database error");
+        }
+    };
+    if used.saturating_add(query.size) > state.max_file_size as i64 {
+        let _ = transaction.rollback().await;
+        remove_quiet(&final_path).await;
+        return api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "PASTE_TOO_LARGE",
+            "Paste attachment quota exceeded",
+        );
+    }
+
     let result = sqlx::query(
         "INSERT INTO files (id, paste_id, enc_meta, size, disk_name, created_at)
          VALUES (?, ?, ?, ?, ?, ?)",
@@ -258,15 +304,24 @@ pub async fn handle_upload(
     .bind(query.size)
     .bind(&disk_name)
     .bind(now)
-    .execute(&state.db)
+    .execute(&mut *transaction)
     .await;
 
     if let Err(error) = result {
+        let _ = transaction.rollback().await;
         remove_quiet(&final_path).await;
         if is_unique_violation(&error) {
             return api_error(StatusCode::CONFLICT, "FILE_EXISTS", "File ID already exists");
         }
         tracing::error!("Failed to insert file: {error}");
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", "Database error");
+    }
+
+    if let Err(error) = transaction.commit().await {
+        // Leave the uploaded file in place: if the commit actually landed
+        // the row needs it, and if not, startup reconciliation cleans the
+        // orphaned disk file.
+        tracing::error!("Failed to commit file insert: {error}");
         return api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", "Database error");
     }
 

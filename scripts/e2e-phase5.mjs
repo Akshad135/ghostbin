@@ -189,6 +189,7 @@ async function createPasteWithShare(base, session) {
     body: JSON.stringify({
       shareSalt: bytesToBase64Url(shareSalt),
       shareAuthKey: bytesToBase64Url(shareKeys.authKey),
+      kdfParams: { ...DEFAULT_ARGON2_PARAMS },
       wrappedPasteKey,
     }),
   });

@@ -13,6 +13,11 @@ pub mod ping;
 pub mod shares;
 pub mod util;
 
+/// Unknown `/api/*` paths must answer with a JSON 404, not the SPA index.
+async fn api_not_found() -> axum::response::Response {
+    util::api_error(axum::http::StatusCode::NOT_FOUND, "NOT_FOUND", "Unknown API endpoint")
+}
+
 /// Build the API sub-router (mounted at `/api`).
 pub fn api_router() -> Router<SharedState> {
     Router::new()
@@ -49,4 +54,5 @@ pub fn api_router() -> Router<SharedState> {
         .route("/shares/{id}/challenge", post(shares::handle_challenge))
         .route("/shares/{id}/unlock", post(shares::handle_unlock))
         .route("/shares/{id}/view", post(shares::handle_view))
+        .fallback(api_not_found)
 }

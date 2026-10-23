@@ -6,6 +6,12 @@
 
 const API_BASE = "/api";
 
+// Attachment transfers scale their abort timer with the payload size so a
+// max-size file on a slow link is not cut off mid-transfer.
+const SLOW_LINK_BYTES_PER_SEC = 100 * 1024;
+const timeoutForBytes = (bytes: number, floorMs: number) =>
+  Math.max(floorMs, (bytes / SLOW_LINK_BYTES_PER_SEC) * 1000);
+
 export type BurnMode = "time" | "unlock_count";
 
 export interface KdfParams {
@@ -17,6 +23,8 @@ export interface KdfParams {
 
 export interface AuthParams {
   configured: boolean;
+  /** True when the server requires SETUP_TOKEN to claim a fresh instance. */
+  setupTokenRequired?: boolean;
   kdfSalt?: string;
   kdfParams?: KdfParams;
 }
@@ -103,6 +111,8 @@ export type ShareStatusResponse =
 export interface CreateShareInput {
   shareSalt: string;
   shareAuthKey: string;
+  /** KDF params the share keys were derived with; pinned per share. */
+  kdfParams: KdfParams;
   wrappedPasteKey: string;
   expiresAt?: number | null;
   maxUnlocks?: number | null;
@@ -316,17 +326,26 @@ async function downloadFile(
   if (shareToken) headers.set("X-Share-Token", shareToken);
 
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), 60_000);
+  let timeout = window.setTimeout(() => controller.abort(), timeoutForBytes(0, 60_000));
 
-  let response: Response;
   try {
-    response = await fetch(`${API_BASE}/files/${encodeURIComponent(fileId)}`, {
+    const response = await fetch(`${API_BASE}/files/${encodeURIComponent(fileId)}`, {
       headers,
       credentials: "include",
       cache: "no-store",
       signal: controller.signal,
     });
+    // Headers are in — re-arm the timer for the body based on its size so
+    // large attachments on slow links are not cut off mid-download.
+    window.clearTimeout(timeout);
+    timeout = window.setTimeout(
+      () => controller.abort(),
+      timeoutForBytes(Number(response.headers.get("Content-Length") ?? 0), 60_000),
+    );
+    if (!response.ok) throw await errorFromResponse(response);
+    return new Uint8Array(await response.arrayBuffer());
   } catch (error) {
+    if (error instanceof ApiError) throw error;
     if (error instanceof DOMException && error.name === "AbortError") {
       throw new ApiError("The file download timed out", 0, "TIMEOUT");
     }
@@ -334,9 +353,6 @@ async function downloadFile(
   } finally {
     window.clearTimeout(timeout);
   }
-
-  if (!response.ok) throw await errorFromResponse(response);
-  return new Uint8Array(await response.arrayBuffer());
 }
 
 interface UploadFileInput {
@@ -368,7 +384,10 @@ async function uploadFile(input: UploadFileInput): Promise<void> {
   });
 
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), 120_000);
+  const timeout = window.setTimeout(
+    () => controller.abort(),
+    timeoutForBytes(input.encrypted.byteLength, 120_000),
+  );
 
   let response: Response;
   try {
@@ -460,14 +479,25 @@ function assertAuthSession(
 export const api = {
   auth: {
     params: () => request<AuthParams>("/auth/params"),
-    setup: async (body: {
-      authKey: string;
-      kdfSalt: string;
-      kdfParams: KdfParams;
-      wrappedVaultKey: string;
-    }) => {
+    setup: async (
+      body: {
+        authKey: string;
+        kdfSalt: string;
+        kdfParams: KdfParams;
+        wrappedVaultKey: string;
+      },
+      setupToken?: string,
+    ) => {
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+      };
+      if (setupToken) headers["X-Setup-Token"] = setupToken;
       const response = assertAuthSession(
-        await jsonRequest<AuthSessionResponse>("/auth/setup", "POST", body),
+        await request<AuthSessionResponse>("/auth/setup", {
+          method: "POST",
+          body: JSON.stringify(body),
+          headers,
+        }),
       );
       setCsrfToken(response.csrfToken);
       return response;

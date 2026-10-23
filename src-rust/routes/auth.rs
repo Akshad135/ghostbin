@@ -207,6 +207,7 @@ pub async fn handle_params(State(state): State<Arc<AppState>>) -> Response {
                 no_store(),
                 Json(serde_json::json!({
                     "configured": true,
+                    "setupTokenRequired": false,
                     "kdfSalt": auth::encode_base64url(&settings.kdf_salt),
                     "kdfParams": params,
                 })),
@@ -216,7 +217,10 @@ pub async fn handle_params(State(state): State<Arc<AppState>>) -> Response {
         Ok(None) => (
             StatusCode::OK,
             no_store(),
-            Json(serde_json::json!({ "configured": false })),
+            Json(serde_json::json!({
+                "configured": false,
+                "setupTokenRequired": state.setup_token.is_some(),
+            })),
         )
             .into_response(),
         Err(error) => {
@@ -242,6 +246,26 @@ pub async fn handle_setup(
             "CSRF_REJECTED",
             "Cross-site setup request rejected",
         );
+    }
+
+    // When SETUP_TOKEN is configured, only requests carrying it may claim
+    // this fresh instance — otherwise a scanner that reaches the server
+    // before the owner could permanently squat the setup.
+    if let Some(expected) = &state.setup_token {
+        let provided = headers
+            .get("x-setup-token")
+            .and_then(|value| value.to_str().ok());
+        let matches = provided.is_some_and(|provided| {
+            use subtle::ConstantTimeEq;
+            provided.as_bytes().ct_eq(expected.as_bytes()).into()
+        });
+        if !matches {
+            return api_error(
+                StatusCode::FORBIDDEN,
+                "SETUP_TOKEN_REQUIRED",
+                "A valid setup token is required to claim this server",
+            );
+        }
     }
 
     let Some(auth_key) = auth::decode_base64url(&body.auth_key, auth::AUTH_KEY_BYTES) else {
@@ -492,6 +516,7 @@ pub async fn handle_logout(State(state): State<Arc<AppState>>, headers: HeaderMa
 /// POST /api/auth/change-passphrase — replace the auth key and wrapped vault.
 pub async fn handle_change_passphrase(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<ChangePassphraseBody>,
 ) -> Response {
@@ -501,6 +526,18 @@ pub async fn handle_change_passphrase(
             "CSRF_REJECTED",
             "Missing or invalid CSRF token",
         );
+    }
+
+    // The old-auth-key check below is an online guessing channel; give it
+    // the same per-IP and per-account throttling as login so a stolen
+    // session cannot brute-force the passphrase-derived key unthrottled.
+    let ip = state.client_ip(addr.ip(), &headers);
+
+    if let Some(retry_after) = login_retry_after(&state, ip) {
+        return rate_limited(retry_after);
+    }
+    if let Some(retry_after) = account_login_retry_after(&state) {
+        return rate_limited(retry_after);
     }
 
     let session = match auth::current_session(&state.db, &headers).await {
@@ -578,12 +615,17 @@ pub async fn handle_change_passphrase(
     };
 
     if !auth::auth_key_matches(&settings.auth_hash, &old_auth_key) {
+        record_login_failure(&state, ip);
+        record_account_login_failure(&state);
         return api_error(
             StatusCode::UNAUTHORIZED,
             "INVALID_AUTH",
             "Invalid authentication key",
         );
     }
+
+    clear_login_failures(&state, ip);
+    clear_account_login_failures(&state);
 
     let new_auth_hash = auth::hash_auth_key(&new_auth_key);
     let new_kdf_params = match serde_json::to_string(&body.new_kdf_params) {
@@ -761,7 +803,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .expect("in-memory SQLite");
-        crate::db::init_schema(&pool, false)
+        crate::db::init_schema(&pool, crate::db::ResetDb::No)
             .await
             .expect("schema init");
         Arc::new(AppState::new(
@@ -771,6 +813,7 @@ mod tests {
             1024,
             1024,
             Vec::new(),
+            None,
         ))
     }
 
@@ -977,6 +1020,7 @@ mod tests {
         let new_auth_key = auth::encode_base64url(&[4u8; auth::AUTH_KEY_BYTES]);
         let response = handle_change_passphrase(
             State(state.clone()),
+            ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1234))),
             session_headers(&session_token, &csrf_token),
             Json(ChangePassphraseBody {
                 old_auth_key,
@@ -1016,5 +1060,101 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn change_passphrase_failures_are_rate_limited() {
+        let state = test_state().await;
+        let setup = setup_body();
+        let good_key = setup.auth_key.clone();
+        let response = handle_setup(State(state.clone()), HeaderMap::new(), Json(setup)).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let response = handle_login(
+            State(state.clone()),
+            ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1234))),
+            HeaderMap::new(),
+            Json(LoginBody { auth_key: good_key }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookies = response.headers().clone();
+        let session_token = set_cookie_value(&cookies, auth::SESSION_COOKIE_NAME).unwrap();
+        let csrf_token = set_cookie_value(&cookies, auth::CSRF_COOKIE_NAME).unwrap();
+
+        let wrong_old_key = auth::encode_base64url(&[9u8; auth::AUTH_KEY_BYTES]);
+        let wrong_body = || ChangePassphraseBody {
+            old_auth_key: wrong_old_key.clone(),
+            new_auth_key: auth::encode_base64url(&[4u8; auth::AUTH_KEY_BYTES]),
+            new_kdf_salt: auth::encode_base64url(&[5u8; auth::KDF_SALT_BYTES]),
+            new_kdf_params: KdfParams::default(),
+            new_wrapped_vault_key: format!(
+                "v1:{}",
+                auth::encode_base64url(&[6u8; auth::WRAPPED_VAULT_KEY_BYTES])
+            ),
+        };
+        for _ in 0..MAX_LOGIN_ATTEMPTS {
+            let response = handle_change_passphrase(
+                State(state.clone()),
+                ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1234))),
+                session_headers(&session_token, &csrf_token),
+                Json(wrong_body()),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        // The next attempt from this IP is throttled before the key check —
+        // a stolen session cannot brute-force the old auth key unthrottled.
+        let response = handle_change_passphrase(
+            State(state.clone()),
+            ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1234))),
+            session_headers(&session_token, &csrf_token),
+            Json(wrong_body()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    #[tokio::test]
+    async fn setup_token_is_required_when_configured() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite");
+        crate::db::init_schema(&pool, crate::db::ResetDb::No)
+            .await
+            .expect("schema init");
+        let state = Arc::new(AppState::new(
+            pool,
+            "dist".to_string(),
+            "uploads".to_string(),
+            1024,
+            1024,
+            Vec::new(),
+            Some("correct-token".to_string()),
+        ));
+
+        let response = handle_params(State(state.clone())).await;
+        let body = response_json(response).await;
+        assert_eq!(body["configured"], false);
+        assert_eq!(body["setupTokenRequired"], true);
+
+        let response =
+            handle_setup(State(state.clone()), HeaderMap::new(), Json(setup_body())).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response_json(response).await["code"], "SETUP_TOKEN_REQUIRED");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-setup-token", HeaderValue::from_static("wrong"));
+        let response = handle_setup(State(state.clone()), headers, Json(setup_body())).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-setup-token", HeaderValue::from_static("correct-token"));
+        let response = handle_setup(State(state), headers, Json(setup_body())).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
     }
 }

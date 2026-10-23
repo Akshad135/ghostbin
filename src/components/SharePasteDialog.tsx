@@ -116,6 +116,9 @@ export function SharePasteDialog({
             const response = await api.share.create(paste.id, {
                 shareSalt: bytesToBase64Url(shareSalt),
                 shareAuthKey: bytesToBase64Url(authKey),
+                // Pin the derivation params on the share so guests always
+                // derive with what the share was created with.
+                kdfParams: { ...DEFAULT_ARGON2_PARAMS },
                 wrappedPasteKey,
                 replace,
             });

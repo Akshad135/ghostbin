@@ -144,12 +144,18 @@ export function EditPaste() {
                 const status = await api.share.status(id).catch(() => ({ exists: false as const }));
                 const key = await pasteKeyForSummary(vaultKey, detail);
                 const fields = await decryptPasteWithKey(key, detail);
-                const files = await Promise.all(
-                    detail.files.map(async (file) => ({
-                        meta: file,
-                        plain: await decryptAttachmentMeta(key, id, file),
-                    })),
-                );
+                const files: ExistingFile[] = [];
+                let failedFiles = 0;
+                for (const file of detail.files) {
+                    try {
+                        files.push({
+                            meta: file,
+                            plain: await decryptAttachmentMeta(key, id, file),
+                        });
+                    } catch {
+                        failedFiles += 1;
+                    }
+                }
                 if (cancelled) return;
 
                 const burn = burnDisplay(detail);
@@ -167,6 +173,11 @@ export function EditPaste() {
                 setBurnDirty(false);
                 setHasShare(status.exists);
                 setNotFound(false);
+                if (failedFiles > 0) {
+                    toast.error(
+                        `${failedFiles} attachment${failedFiles === 1 ? '' : 's'} could not be decrypted`,
+                    );
+                }
             } catch (error) {
                 if (cancelled) return;
                 if (error instanceof ApiError && (error.status === 404 || error.status === 410)) {

@@ -34,9 +34,15 @@ interface AuthContextType {
   isLoading: boolean;
   /** null means the server has not answered yet. */
   configured: boolean | null;
+  /** True when claiming this instance requires the SETUP_TOKEN secret. */
+  setupTokenRequired: boolean;
   vaultKey: CryptoKey | null;
   error: string | null;
-  setup: (passphrase: string, rememberDevice: boolean) => Promise<void>;
+  setup: (
+    passphrase: string,
+    rememberDevice: boolean,
+    setupToken?: string,
+  ) => Promise<void>;
   login: (passphrase: string, rememberDevice: boolean) => Promise<void>;
   logout: () => Promise<void>;
   /** Drop the vault key locally (memory + cache) without ending the session. */
@@ -71,6 +77,7 @@ function assertPassphrase(passphrase: string): void {
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [isLoading, setIsLoading] = useState(true);
   const [configured, setConfigured] = useState<boolean | null>(null);
+  const [setupTokenRequired, setSetupTokenRequired] = useState(false);
   const [vaultKey, setVaultKey] = useState<CryptoKey | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -93,9 +100,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
       setConfigured(params.configured);
       if (params.configured === false) {
+        setSetupTokenRequired(params.setupTokenRequired === true);
         await forgetVaultKey();
         return;
       }
+      setSetupTokenRequired(false);
       if (!params.kdfSalt || !params.kdfParams) {
         throw new Error("The server returned invalid login parameters.");
       }
@@ -174,7 +183,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [],
   );
 
-  const setup = useCallback(async (passphrase: string, rememberDevice: boolean) => {
+  const setup = useCallback(
+    async (passphrase: string, rememberDevice: boolean, setupToken?: string) => {
     setIsLoading(true);
     setError(null);
 
@@ -205,12 +215,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       vaultBytes = generateVaultKey();
       const wrappedVaultKey = await wrapVaultKey(masterKey, vaultBytes);
 
-      await api.auth.setup({
-        authKey: bytesToBase64Url(authKey),
-        kdfSalt: bytesToBase64Url(salt),
-        kdfParams: { ...DEFAULT_ARGON2_PARAMS },
-        wrappedVaultKey,
-      });
+      await api.auth.setup(
+        {
+          authKey: bytesToBase64Url(authKey),
+          kdfSalt: bytesToBase64Url(salt),
+          kdfParams: { ...DEFAULT_ARGON2_PARAMS },
+          wrappedVaultKey,
+        },
+        setupToken,
+      );
 
       const keyHandle = await importVaultKey(vaultBytes);
       await persistKey(keyHandle, await vaultStamp(wrappedVaultKey), rememberDevice);
@@ -367,6 +380,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       isAuthenticated: vaultKey !== null,
       isLoading,
       configured,
+      setupTokenRequired,
       vaultKey,
       error,
       setup,
@@ -380,6 +394,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       vaultKey,
       isLoading,
       configured,
+      setupTokenRequired,
       error,
       setup,
       login,

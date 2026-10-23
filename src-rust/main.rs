@@ -31,9 +31,15 @@ async fn main() {
     // ── Config from env ────────────────────────────────────────────────
     let db_path =
         std::env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/ghostbin.sqlite".to_string());
-    let reset_db = std::env::var("RESET_DB")
-        .map(|value| value == "1")
-        .unwrap_or(false);
+    let reset_db = match std::env::var("RESET_DB").unwrap_or_default().trim() {
+        "" | "0" => db::ResetDb::No,
+        "1" => db::ResetDb::IfIncompatible,
+        "force" => db::ResetDb::Force,
+        other => {
+            tracing::error!("Invalid RESET_DB value {other:?}; expected 1 or force.");
+            std::process::exit(1);
+        }
+    };
     let port: u16 = std::env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -84,6 +90,17 @@ async fn main() {
         tracing::info!("HSTS enabled (Strict-Transport-Security will be sent)");
     }
 
+    // SETUP_TOKEN optionally protects the one-time /api/auth/setup claim on
+    // a fresh instance, so a scanner cannot squat the vault in the window
+    // between deploy and first-run setup.
+    let setup_token = std::env::var("SETUP_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if setup_token.is_some() {
+        tracing::info!("SETUP_TOKEN is set — claiming this instance requires the token");
+    }
+
     // BIND_ADDR defaults to all interfaces for container compatibility.
     // For bare-metal deploys without a TLS proxy in front, bind to
     // 127.0.0.1 and put a reverse proxy in front instead (plan §9).
@@ -99,6 +116,7 @@ async fn main() {
         bind_raw
             .parse()
             .or_else(|_| format!("{bind_raw}:{port}").parse())
+            .or_else(|_| format!("[{bind_raw}]:{port}").parse())
             .unwrap_or_else(|_| {
                 // Unparseable BIND_ADDR must not silently widen exposure.
                 tracing::error!("Invalid BIND_ADDR {bind_raw:?}; refusing to start.");
@@ -131,6 +149,7 @@ async fn main() {
         max_file_size,
         max_text_size,
         trusted_proxies,
+        setup_token,
     ));
 
     tracing::info!(

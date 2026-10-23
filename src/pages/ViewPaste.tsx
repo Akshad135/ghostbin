@@ -323,17 +323,28 @@ export function ViewPaste() {
                 const detail = await api.pastes.get(id);
                 const key = await pasteKeyForSummary(vaultKey, detail);
                 const fields = await decryptPasteWithKey(key, detail);
-                const files = await Promise.all(
-                    detail.files.map(async (file) => ({
-                        meta: file,
-                        plain: await decryptAttachmentMeta(key, id, file),
-                    })),
-                );
+                const files: OwnerFile[] = [];
+                let failedFiles = 0;
+                for (const file of detail.files) {
+                    try {
+                        files.push({
+                            meta: file,
+                            plain: await decryptAttachmentMeta(key, id, file),
+                        });
+                    } catch {
+                        failedFiles += 1;
+                    }
+                }
                 const status = await api.share.status(id).catch(() => ({ exists: false as const }));
                 if (cancelled) return;
                 setOwnerData({ paste: detail, fields, files, key });
                 setShareInfo(status.exists ? status.share : null);
                 setPage('owner');
+                if (failedFiles > 0) {
+                    toast.error(
+                        `${failedFiles} attachment${failedFiles === 1 ? '' : 's'} could not be decrypted`,
+                    );
+                }
             } catch (loadError) {
                 if (cancelled) return;
                 if (loadError instanceof ApiError && (loadError.status === 404 || loadError.status === 410)) {
@@ -639,7 +650,11 @@ export function ViewPaste() {
         } catch (unlockFailure) {
             if (!isCurrent()) return;
             if (unlockFailure instanceof ShareCodeError) {
-                setUnlockError('Enter the full 14-character access code.');
+                setUnlockError(
+                    unlockFailure.reason === 'alphabet'
+                        ? 'The code contains a character outside its alphabet (no 0, 1, I, or O).'
+                        : 'Enter the full 14-character access code.',
+                );
             } else if (unlockFailure instanceof ApiError) {
                 if (unlockFailure.status === 429) {
                     setUnlockError(
@@ -684,7 +699,7 @@ export function ViewPaste() {
     }
 
     if (effectivePage === 'error') {
-        return <ErrorState error={error} />;
+        return <ErrorState type="error" error={error} />;
     }
 
     if (effectivePage === 'private') {
@@ -800,7 +815,7 @@ export function ViewPaste() {
     }
 
     const pasteExists = Boolean(ownerData || guestData);
-    if (!pasteExists) return <ErrorState error={error} />;
+    if (!pasteExists) return <ErrorState type="error" error={error} />;
 
     return (
         <div className="mx-auto max-w-5xl w-full px-4 sm:px-6 py-5">

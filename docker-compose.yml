@@ -22,6 +22,10 @@ services:
       - TRUSTED_PROXIES=${TRUSTED_PROXIES:-}
       # Set to 1 when served over TLS end-to-end (adds HSTS).
       - HSTS_ENABLED=${HSTS_ENABLED:-0}
+      # Optional shared secret required to claim a fresh instance via the
+      # setup dialog. Set it before exposing the server publicly.
+      # Example: SETUP_TOKEN=long-random-string
+      - SETUP_TOKEN=${SETUP_TOKEN:-}
       # Maximum size (bytes) for a text paste's content. Default: 524288 (512 KB).
       - MAX_TEXT_SIZE=${MAX_TEXT_SIZE:-524288}
       # Maximum size (bytes) for a single file attachment. Default: 52428800 (50 MB).
