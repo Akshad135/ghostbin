@@ -25,6 +25,9 @@ export interface AuthParams {
   configured: boolean;
   /** True when the server requires SETUP_TOKEN to claim a fresh instance. */
   setupTokenRequired?: boolean;
+  /** Server-side size limits; the browser adopts these at runtime. */
+  maxTextSize?: number;
+  maxFileSize?: number;
   kdfSalt?: string;
   kdfParams?: KdfParams;
 }

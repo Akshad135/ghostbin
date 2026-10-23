@@ -91,7 +91,7 @@ configured via environment variables.
 
 3. Open `http://localhost:8788` in your browser.
 
-> **Note:** `MAX_TEXT_SIZE`, `MAX_FILE_SIZE`, `ALLOWED_ORIGINS`, `TRUSTED_PROXIES`, `HSTS_ENABLED`, `SETUP_TOKEN`, and `RESET_DB` can be defined in an `.env` file in the root directory (see [.env.example](.env.example)). The browser enforces the size caps with build-time values — see `.env.example` if you raise the server limits.
+> **Note:** `MAX_TEXT_SIZE`, `MAX_FILE_SIZE`, `ALLOWED_ORIGINS`, `TRUSTED_PROXIES`, `HSTS_ENABLED`, `SETUP_TOKEN`, and `RESET_DB` can be defined in an `.env` file in the root directory (see [.env.example](.env.example)). The size limits are the single source of truth — the browser adopts the server's values automatically at page load.
 
 ## Local Build
 

@@ -8,6 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import { api, ApiError, setCsrfToken } from "./api";
+import { applyServerLimits } from "./config";
 import {
   clearVaultKey,
   loadVaultKey,
@@ -98,6 +99,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (params.configured !== true && params.configured !== false) {
         throw new Error("The server returned invalid configuration data.");
       }
+      // The server env is the single source of truth for size limits.
+      applyServerLimits(params);
       setConfigured(params.configured);
       if (params.configured === false) {
         setSetupTokenRequired(params.setupTokenRequired === true);

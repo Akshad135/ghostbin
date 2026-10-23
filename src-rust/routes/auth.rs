@@ -210,6 +210,8 @@ pub async fn handle_params(State(state): State<Arc<AppState>>) -> Response {
                     "setupTokenRequired": false,
                     "kdfSalt": auth::encode_base64url(&settings.kdf_salt),
                     "kdfParams": params,
+                    "maxTextSize": state.max_text_size,
+                    "maxFileSize": state.max_file_size,
                 })),
             )
                 .into_response()
@@ -220,6 +222,8 @@ pub async fn handle_params(State(state): State<Arc<AppState>>) -> Response {
             Json(serde_json::json!({
                 "configured": false,
                 "setupTokenRequired": state.setup_token.is_some(),
+                "maxTextSize": state.max_text_size,
+                "maxFileSize": state.max_file_size,
             })),
         )
             .into_response(),
@@ -875,6 +879,12 @@ mod tests {
             .unwrap()
             .to_string();
 
+        let response = handle_params(State(state.clone())).await;
+        let body = response_json(response).await;
+        assert_eq!(body["configured"], true);
+        assert_eq!(body["maxTextSize"], 1024);
+        assert_eq!(body["maxFileSize"], 1024);
+
         let response = handle_login(
             State(state.clone()),
             ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1234))),
@@ -1141,6 +1151,8 @@ mod tests {
         let body = response_json(response).await;
         assert_eq!(body["configured"], false);
         assert_eq!(body["setupTokenRequired"], true);
+        assert_eq!(body["maxTextSize"], 1024);
+        assert_eq!(body["maxFileSize"], 1024);
 
         let response =
             handle_setup(State(state.clone()), HeaderMap::new(), Json(setup_body())).await;
