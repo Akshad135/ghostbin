@@ -172,6 +172,9 @@ export interface ViewResponse {
 
 export interface PasteEvent {
   type: string;
+  // Empty for "resync" events: the server sends those (without a pasteId)
+  // when a connection lagged and may have dropped events, so listeners
+  // should refetch state instead of keying on a specific paste.
   pasteId: string;
 }
 
@@ -435,7 +438,12 @@ function subscribeEvents(listener: (event: PasteEvent) => void): () => void {
       if (typeof message.data !== "string") return;
       try {
         const event = JSON.parse(message.data) as Partial<PasteEvent>;
-        if (typeof event.type === "string" && typeof event.pasteId === "string") {
+        if (event.type === "resync") {
+          listener({ type: "resync", pasteId: "" });
+        } else if (
+          typeof event.type === "string" &&
+          typeof event.pasteId === "string"
+        ) {
           listener({ type: event.type, pasteId: event.pasteId });
         }
       } catch {

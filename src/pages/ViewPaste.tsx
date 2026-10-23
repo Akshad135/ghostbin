@@ -433,6 +433,14 @@ export function ViewPaste() {
     useEffect(() => {
         if (!isOwner || !id) return;
         return api.events.subscribe((event) => {
+            if (event.type === 'resync') {
+                // This connection lagged and may have missed events —
+                // including this paste being deleted or burned.
+                if (!shareDialogOpen) {
+                    setOwnerReload((value) => value + 1);
+                }
+                return;
+            }
             if (event.pasteId !== id) return;
             if (event.type === 'paste_deleted' || event.type === 'paste_burned') {
                 setOwnerData(null);
