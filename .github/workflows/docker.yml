@@ -1,14 +1,9 @@
 name: Build and Push Docker Image
 
+# Manual only: builds never run automatically. Trigger from the Actions
+# tab ("Run workflow") and pick the branch or tag to build.
 on:
-  push:
-    branches:
-      - main
-    tags:
-      - 'v*'
-  pull_request:
-    branches:
-      - main
+  workflow_dispatch:
 
 jobs:
   build-and-push:
