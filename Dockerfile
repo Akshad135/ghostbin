@@ -45,7 +45,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARG
 # dependencies baked into the layer above.)
 COPY src-rust ./src-rust
 COPY schema.sql ./
+# BuildKit COPY preserves context mtimes, which predate the dummy build
+# above — cargo's mtime fingerprints then treat the real sources as
+# unchanged and this step becomes a silent no-op that ships the dummy
+# binary (seen in CI 2026-10-23). Refresh mtimes and drop the crate's
+# fingerprints so this build always recompiles the crate.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETPLATFORM} \
+    find src-rust schema.sql -exec touch {} + && \
+    rm -rf target/release/.fingerprint/ghostbin[-_]server* && \
     cargo build --release --locked && \
     cp /app/target/release/ghostbin-server /app/ghostbin-server_built
 
